@@ -167,6 +167,18 @@ def adaptive_exploration(steps, updates, uncertainty=1.):
     bound = math.sqrt(math.log(2. * ACT_N * decisions) / (2. * observations))
     return max(0., min(1., float(uncertainty) * bound))
 
+class InputLeaseStop:
+    def __init__(self, device):
+        self.device = device
+
+    def is_set(self):
+        device = self.device
+        return bool((device.input_generation_guard is not None and
+                     not device.input_generation_guard(device.input_generation)) or
+                    (device.keyboard_guard is not None and not device.keyboard_guard.is_set()) or
+                    (device.human_guard is not None and not device.human_guard()))
+
+
 class AnyStop:
     def __init__(self, *events):
         self.events = events
@@ -262,23 +274,145 @@ def demonstration_from_events(old_cursor, cursor, old_held, held, events, region
     return tuple(samples)
 
 
-def permitted_autonomous_control(action, ctrl, demonstrations, held, click_target=False):
+def permitted_autonomous_control(action, ctrl, demonstrations, held, exploration=()):
     allowed = set(demonstrations)
+    allowed.update(exploration)
     for button in ('l', 'r', 'm'):
         if held.get(button, False):
             allowed.add(BUTTON_ACTIONS[(button, False)])
-    if click_target:
-        allowed.add(BUTTON_ACTIONS[('l', True)])
     if action not in MOTION_ACTIONS and action != IDLE_ACTION and action not in allowed:
         action, ctrl = IDLE_ACTION, anchor_control(IDLE_ACTION)
     values = list(normalize_control(ctrl))
-    for button, channel in (('l', 3), ('r', 4), ('m', 5)):
-        direction = 1. if values[channel] > 0. else -1.
-        if abs(values[channel]) > 0. and BUTTON_ACTIONS.get((button, direction > 0.)) not in allowed:
-            values[channel] = -1. if held.get(button, False) else 0.
-    if values[6] and not any(ACT[index][4] * values[6] > 0. for index in allowed):
+    primitive = ACT[action]
+    if primitive[3]:
+        values[:3] = [0., 0., 0.]
         values[6] = 0.
+        for button, channel in (('l', 3), ('r', 4), ('m', 5)):
+            values[channel] = (1. if primitive[3][1] == '+' else -1.) if primitive[3][0] == button else 0.
+    else:
+        values[3:6] = [0., 0., 0.]
+        if primitive[4]:
+            values[:3] = [0., 0., 0.]
+            values[6] = math.copysign(abs(values[6]) if abs(values[6]) > sys.float_info.epsilon else abs(primitive[4]), primitive[4])
+        else:
+            values[6] = 0.
+            if action == IDLE_ACTION:
+                values[:3] = [0., 0., 0.]
     return action, normalize_control(values)
+
+
+class ExplorationEvidence:
+    def __init__(self):
+        self.tried = set()
+        self.tried_order = deque()
+        self.last_scene = None
+        self.attempts = 0
+        self.effects = 0
+        self.pending_release = False
+
+    def allowable(self, frame, meta, controls, held):
+        if held.get('l', False):
+            return {BUTTON_ACTIONS[('l', False)]}
+        scene = session_signature(frame)
+        point = (round(float(meta[4]) * VIS_W / CELL_W), round(float(meta[5]) * VIS_H / CELL_H))
+        allowed = set(controls)
+        if (scene, point) in self.tried:
+            allowed.discard(BUTTON_ACTIONS[('l', True)])
+        self.last_scene = (scene, point)
+        return allowed
+
+    def choose(self, action, ctrl, allowed, feedback):
+        press = BUTTON_ACTIONS[('l', True)]
+        if press not in allowed:
+            return action, ctrl
+        seen = max(1, feedback.total)
+        threshold = max(1, math.isqrt(seen))
+        if feedback.stagnant >= threshold and action in MOTION_ACTIONS:
+            return press, anchor_control(press)
+        return action, ctrl
+
+    def observe(self, action, before, after, outcome):
+        if action != BUTTON_ACTIONS[('l', True)] or self.last_scene is None:
+            return
+        if self.last_scene not in self.tried:
+            self.tried.add(self.last_scene)
+            self.tried_order.append(self.last_scene)
+        while len(self.tried_order) > REPLAY_LIMIT:
+            self.tried.discard(self.tried_order.popleft())
+        self.attempts += 1
+        if (session_signature(before) != session_signature(after) and
+                outcome.get('efficacy', 0.) > 0. and not outcome.get('blocked')):
+            self.effects += 1
+
+
+def coalesce_observation(memory, observation):
+    if memory:
+        previous = memory[-1][3]
+        if previous is observation or previous == observation:
+            return previous
+    return observation
+
+
+def demonstrated_controls(records):
+    index = {}
+    for row in records:
+        if len(row) < 14 or not row[13] or row[12] or row[11] <= 0.:
+            continue
+        action = row[2]
+        if action in MOTION_ACTIONS or action == IDLE_ACTION:
+            continue
+        meta = row[1]
+        if len(meta) != META_N:
+            continue
+        try:
+            key = (session_signature(row[0]), round(meta[4] * VIS_W / CELL_W), round(meta[5] * VIS_H / CELL_H))
+            index.setdefault(key, set()).add(action)
+        except (ValueError, TypeError, OverflowError):
+            continue
+    return index
+
+
+def matching_demonstrations(index, frame, meta):
+    if not index:
+        return set()
+    signature = session_signature(frame)
+    cell_x = round(meta[4] * VIS_W / CELL_W)
+    cell_y = round(meta[5] * VIS_H / CELL_H)
+    result = set()
+    for x in (cell_x - 1, cell_x, cell_x + 1):
+        for y in (cell_y - 1, cell_y, cell_y + 1):
+            result.update(index.get((signature, x, y), ()))
+    return result
+
+
+def demonstrated_target_cells(index):
+    targets = {}
+    for (signature, cx, cy), actions in index.items():
+        if any(ACT[action][3].endswith('+') for action in actions):
+            targets.setdefault(signature, set()).add((cx, cy))
+    return targets
+
+
+def demonstrated_pointer_gain(targets, frame, before, after, region):
+    if not targets or before == after:
+        return 0.
+    x, y, w, h = region
+    if w <= 0 or h <= 0:
+        return 0.
+    signature = session_signature(frame)
+    columns = VIS_W / CELL_W
+    rows = VIS_H / CELL_H
+    start = ((before[0] - x) / w, (before[1] - y) / h)
+    finish = ((after[0] - x) / w, (after[1] - y) / h)
+    progress = 0.
+    for cx, cy in targets.get(signature, ()):
+        target = (max(0., min(1., cx / columns)), max(0., min(1., cy / rows)))
+        old_dist = math.dist(start, target)
+        new_dist = math.dist(finish, target)
+        radius = math.hypot(1. / columns, 1. / rows)
+        if old_dist > radius and new_dist < old_dist:
+            progress = max(progress, min(1., (old_dist - new_dist) / old_dist))
+    return progress
 
 
 def pointer_offset(dx, dy, meta):
@@ -762,6 +896,8 @@ class Feedback:
         self.transition_frequency = {}
         self.recent_states = deque(maxlen=max(2, math.isqrt(REPLAY_LIMIT)))
         self.progress_effects = 0
+        self.demonstrated_goal_matches = 0
+        self.demonstrated_pointer_advances = 0
         self.efficacy_total = 0.
         self.stagnant = 0
         self.loop_count = 0
@@ -865,7 +1001,11 @@ class Feedback:
         state_advantage = max(0., new_value - old_value) * (new_seen / (1. + new_seen))
         reached = bool(outcome.get('goal_reached') and outcome.get('goal_demonstrated')) and signal and not loop
         goal_gain = attributable * persistence * float(reached)
-        gain = (causal_strength + discovery * persistence + state_advantage * attributable + goal_gain) * efficacy * novelty * float(not loop)
+        pointer_gain = max(0., min(1., float(outcome.get('demonstration_progress', 0.))))
+        pointer_gain *= float(action in MOTION_ACTIONS and outcome.get('moved', 0.) > 0. and not outcome['blocked'])
+        intrinsic_gain = (causal_strength + discovery * persistence + state_advantage * attributable) * novelty
+        task_gain = goal_gain + pointer_gain
+        gain = (intrinsic_gain + task_gain) * efficacy * float(not loop)
         if signal:
             n = prior_count + 1
             d = impact - prior_effect
@@ -875,11 +1015,13 @@ class Feedback:
         attempted = float(action != IDLE_ACTION and not outcome.get('pending_scroll'))
         failure = attempted * (1. - efficacy)
         failure += float(bool(outcome['blocked']))
-        failure += float(not signal) * repetition * attempted
+        failure += float(not signal and not pointer_gain) * repetition * attempted
         failure += repeated_fraction * float(loop)
-        failure += attempted * repetition * repeated_fraction * float(not signal or new_seen >= old_seen)
+        failure += attempted * repetition * repeated_fraction * float((not signal and not pointer_gain) or new_seen >= old_seen and not pointer_gain)
         reward = math.tanh(gain - failure)
-        progress = bool(signal and old_signature != signature and not loop and reward > 0. and efficacy > 0. and (reached or causal_strength > 0. or (transition_visits == 0 and repeated_fraction < .5)))
+        progress = bool(signal and old_signature != signature and not loop and reward > 0. and efficacy > 0. and (reached or (prior_count > 1 and causal_strength > 0.)))
+        self.demonstrated_goal_matches += int(reached and efficacy > 0.)
+        self.demonstrated_pointer_advances += int(pointer_gain > 0. and not loop)
         current_value = (new_value * new_seen + max(0., reward) * float(progress)) / (new_seen + 1.)
         self.state_value[signature] = (current_value, new_seen + 1)
         self.stagnant = 0 if progress else self.stagnant + 1
@@ -1606,8 +1748,9 @@ class LiteBrain:
                         self.actor.pop(action_key, None)
 
     def learn(self, ob, meta, action, nxt, nmeta, reward, done, dt, ctrl, intended, executed_action, efficacy, reserved=False, demonstration=False):
-        row = (ob, tuple(meta), int(action), nxt, tuple(nmeta), float(reward), bool(done), float(dt), tuple(ctrl), tuple(intended), int(executed_action), float(efficacy), bool(reserved), bool(demonstration))
         with self.save_lock:
+            ob = coalesce_observation(self.memory, ob)
+            row = (ob, tuple(meta), int(action), nxt, tuple(nmeta), float(reward), bool(done), float(dt), tuple(ctrl), tuple(intended), int(executed_action), float(efficacy), bool(reserved), bool(demonstration))
             self.memory.append(row)
             self.control_evidence.observe(row)
             self.steps += 1
@@ -1898,6 +2041,8 @@ class TorchBrain:
         self.use_float16 = False
         self.grad_scaler = None
         self.perf = {'transfer_ms': 0., 'inference_ms': 0., 'batches': 0, 'training_examples': 0, 'visual_error': 0.}
+        self.inference_durations = deque(maxlen=max(16, math.isqrt(REPLAY_LIMIT)))
+        self.cuda_optimizer_steps = 0
         if getattr(device, 'type', None) == 'cuda':
             try:
                 self.use_bfloat16 = bool(torch.cuda.is_bf16_supported())
@@ -2059,10 +2204,14 @@ class TorchBrain:
                 self.optq.add_param_group({'params': parameters})
             self.target.eval()
 
-    def grow_from_evidence(self, records):
-        if not records:
+    def grow_from_evidence(self, records, validation=()):
+        if not records or not validation:
             return False
-        diverse = len({session_signature(row[0]) for row in records})
+        train_scenes = {session_signature(row[0]) for row in records}
+        validation_scenes = {session_signature(row[0]) for row in validation}
+        if len(validation_scenes) < max(2, math.isqrt(len(train_scenes))):
+            return False
+        diverse = len(train_scenes)
         parameters = sum(parameter.numel() for parameter in self.q.parameters())
         depth = len(self.q.growing)
         worlds = len(self.q.world_models)
@@ -2073,7 +2222,16 @@ class TorchBrain:
         grow_layer = diverse >= layer_evidence and self.steps - self.growth_at_step >= layer_evidence
         grow_model = diverse >= model_evidence and self.steps - self.world_growth_at_step >= model_evidence
         grow_visual = diverse >= visual_evidence and self.steps - self.visual_growth_at_step >= visual_evidence
-        if not grow_layer and not grow_model and not grow_visual:
+        if not (grow_layer or grow_model or grow_visual):
+            return False
+        if grow_model:
+            ratio = self.dynamics_metric(validation)
+            grow_model = ratio is not None and math.isfinite(ratio) and ratio >= 1.
+        if grow_model:
+            grow_layer = grow_visual = False
+        elif grow_layer:
+            grow_visual = False
+        if not (grow_layer or grow_model or grow_visual):
             return False
         layer_parameters = (160 + META_N) * ((160 + META_N) * 2 + 1) + (160 + META_N) * 2 * ((160 + META_N) + 1) + 2 * (160 + META_N)
         world_parameters = sum(parameter.numel() for parameter in self.q.dynamics_alternative.parameters())
@@ -2247,14 +2405,16 @@ class TorchBrain:
                 trust = confidence * predicted_efficacy / max(1e-7, predicted_efficacy + (1. - predicted_efficacy) * epsilon)
         elapsed = (time.monotonic() - inference_started) * 1000.
         self.perf['inference_ms'] += (elapsed - self.perf['inference_ms']) / math.sqrt(1. + self.steps)
+        self.inference_durations.append(elapsed)
         if explore_now:
             action = explore_action(allowed, meta, self.steps, ob, targets)
             return action, self.control_evidence.explore(action, meta)
         return action, anchor_control(action, control, trust)
 
     def learn(self, ob, meta, action, nxt, nmeta, reward, done, dt, ctrl, intended, executed_action, efficacy, reserved=False, demonstration=False):
-        row = (ob, tuple(meta), int(action), nxt, tuple(nmeta), float(reward), bool(done), float(dt), tuple(ctrl), tuple(intended), int(executed_action), float(efficacy), bool(reserved), bool(demonstration))
         with self.save_lock:
+            ob = coalesce_observation(self.memory, ob)
+            row = (ob, tuple(meta), int(action), nxt, tuple(nmeta), float(reward), bool(done), float(dt), tuple(ctrl), tuple(intended), int(executed_action), float(efficacy), bool(reserved), bool(demonstration))
             self.memory.append(row)
             self.control_evidence.observe(row)
             if not reserved:
@@ -2349,6 +2509,8 @@ class TorchBrain:
             efficacy = t.tensor([row[11] for row in batch], dtype=t.float32, device=self.d)
             immediate_reward = t.tensor([row[5] for row in immediate], dtype=t.float32, device=self.d)
             demonstration = t.tensor([len(row) > 13 and row[13] for row in immediate], dtype=t.float32, device=self.d)
+            autonomous = 1. - demonstration
+            autonomous_count = autonomous.sum().clamp(min=1.)
             immediate_future = self.images([row[3] for row in immediate])
             immediate_meta = t.tensor([row[4] for row in immediate], dtype=t.float32, device=self.d)
             with self.autocast():
@@ -2381,19 +2543,20 @@ class TorchBrain:
             vertical_error = t.nn.functional.smooth_l1_loss(reconstructed[:, :, 1:] - reconstructed[:, :, :-1], visual_target[:, :, 1:] - visual_target[:, :, :-1])
             detail_weight = visual_target.flatten(2).std(dim=-1, unbiased=False).mean().detach()
             visual_loss = visual_error + detail_weight * (horizontal_error + vertical_error)
-            temporal = t.nn.functional.smooth_l1_loss(values, targets)
-            effect_loss = t.nn.functional.smooth_l1_loss(effectiveness, effect_targets)
-            execution_loss = t.nn.functional.smooth_l1_loss(execution, efficacy)
+            temporal = (t.nn.functional.smooth_l1_loss(values, targets, reduction='none') * autonomous).sum() / autonomous_count
+            effect_loss = (t.nn.functional.smooth_l1_loss(effectiveness, effect_targets, reduction='none') * autonomous).sum() / autonomous_count
+            execution_loss = (t.nn.functional.smooth_l1_loss(execution, efficacy, reduction='none') * autonomous).sum() / autonomous_count
             futures = self.q.world_predictions(embedding, ctrl)
             predicted_future = futures.mean(dim=0)
             per_head = t.nn.functional.smooth_l1_loss(futures, future_features.detach().unsqueeze(0).expand_as(futures), reduction='none').mean(dim=-1)
             if len(batch) > 1:
                 bootstrap = (t.rand_like(per_head) < 1. - math.exp(-1.)).to(per_head.dtype)
                 bootstrap = bootstrap + (bootstrap.sum(dim=1, keepdim=True) == 0).to(bootstrap.dtype)
-                dynamics_loss = (per_head * bootstrap).sum() / bootstrap.sum().clamp(min=1.)
+                weighted = bootstrap * autonomous.unsqueeze(0)
+                dynamics_loss = (per_head * weighted).sum() / weighted.sum().clamp(min=1.)
             else:
-                dynamics_loss = per_head.mean()
-            evidence = (state - immediate_future).abs().mean(dim=(1, 2, 3)).detach() * efficacy
+                dynamics_loss = (per_head.mean(dim=0) * autonomous).sum() / autonomous_count
+            evidence = (state - immediate_future).abs().mean(dim=(1, 2, 3)).detach() * efficacy * autonomous
             inverse_errors = t.nn.functional.cross_entropy(self.q.infer_action(embedding, future_features.detach()), acts, reduction='none')
             inverse_loss = (inverse_errors * evidence).sum() / evidence.sum().clamp(min=1e-6)
             if len(batch) > 1:
@@ -2402,13 +2565,14 @@ class TorchBrain:
                 logits = (projection @ teachers.T) * math.sqrt(projection.shape[-1])
                 signatures = [session_signature(row[3]) for row in immediate]
                 duplicate = t.tensor([[i != j and signatures[i] == signatures[j] for j in range(len(signatures))] for i in range(len(signatures))], dtype=t.bool, device=self.d)
-                contrastive_loss = t.nn.functional.cross_entropy(logits.masked_fill(duplicate, -1e4), t.arange(len(batch), device=self.d))
+                contrastive_errors = t.nn.functional.cross_entropy(logits.masked_fill(duplicate, -1e4), t.arange(len(batch), device=self.d), reduction='none')
+                contrastive_loss = (contrastive_errors * autonomous).sum() / autonomous_count
             else:
                 contrastive_loss = dynamics_loss * 0.
             advantage = (immediate_reward - effectiveness.detach()).clamp(-1., 1.)
             good = t.sigmoid(advantage / immediate_reward.detach().std(unbiased=False).clamp(min=1e-4))
             desired = ctrl * efficacy[:, None] + intended * (1. - efficacy[:, None])
-            auxiliary = ((predicted - desired).square().mean(dim=1) * (good * efficacy + demonstration)).mean()
+            auxiliary = ((predicted - desired).square().mean(dim=1) * (good * efficacy * autonomous + demonstration)).mean()
             imitation_loss = (t.nn.functional.cross_entropy(qvalues, acts, reduction='none') * demonstration).sum() / demonstration.sum().clamp(min=1.)
             for module in (self.q.effect, self.q.execution):
                 for param in module.parameters():
@@ -2422,23 +2586,29 @@ class TorchBrain:
             confidence = (1. - adaptive_exploration(self.steps, self.grads)) * immediate_reward.detach().std(unbiased=False).clamp(min=1e-5) / (immediate_reward.detach().std(unbiased=False).clamp(min=1e-5) + effect_loss.detach())
             dynamics_weight = (temporal.detach() + effect_loss.detach() + 1e-6) / (temporal.detach() + effect_loss.detach() + dynamics_loss.detach() + 1e-6)
             visual_weight = (temporal.detach() + effect_loss.detach() + dynamics_loss.detach() + 1e-6) / (temporal.detach() + effect_loss.detach() + dynamics_loss.detach() + visual_loss.detach() + 1e-6)
-            loss = temporal + effect_loss + execution_loss + auxiliary + imitation_loss * demonstration.mean() + visual_weight * visual_loss + dynamics_weight * (dynamics_loss + inverse_loss + contrastive_loss) - confidence * actor_gain
+            loss = temporal + effect_loss + execution_loss + auxiliary + imitation_loss * demonstration.mean() + visual_weight * visual_loss + dynamics_weight * (dynamics_loss + inverse_loss + contrastive_loss) - confidence * actor_gain * autonomous.mean()
             if not bool(t.isfinite(loss).item()):
                 raise ValueError('模型训练数值异常')
             if stop.is_set():
                 break
             self.optq.zero_grad(set_to_none=True)
             if self.grad_scaler is not None:
+                scale_before = self.grad_scaler.get_scale()
                 self.grad_scaler.scale(loss).backward()
                 self.grad_scaler.unscale_(self.optq)
                 t.nn.utils.clip_grad_norm_(self.q.parameters(), 1.0)
                 self.grad_scaler.step(self.optq)
                 self.grad_scaler.update()
+                optimizer_updated = self.grad_scaler.get_scale() >= scale_before
             else:
                 loss.backward()
                 t.nn.utils.clip_grad_norm_(self.q.parameters(), 1.0)
                 self.optq.step()
-            self.grads += 1
+                optimizer_updated = True
+            if optimizer_updated:
+                self.grads += 1
+                if getattr(self.d, 'type', None) == 'cuda':
+                    self.cuda_optimizer_steps += 1
             if not sleeping and self.grads % max(2, int(math.sqrt(max(1, self.steps)))) == 0:
                 with t.no_grad():
                     for target_param, param in zip(self.target.parameters(), self.q.parameters()):
@@ -2528,7 +2698,7 @@ class TorchBrain:
                 dynamics_loss = t.nn.functional.smooth_l1_loss(estimated, next_features, reduction='none').mean(dim=1) + disagreement.sqrt()
                 demonstration = t.tensor([len(row) > 13 and row[13] for row in segment], dtype=t.float32, device=self.d)
                 imitation_loss = t.nn.functional.cross_entropy(values, actions, reduction='none') * demonstration
-                segment_loss = q_loss + effect_loss + execution_loss + dynamics_loss + actor_loss + visual_loss + inverse_loss + imitation_loss
+                segment_loss = (q_loss + effect_loss + execution_loss + dynamics_loss + inverse_loss) * (1. - demonstration) + actor_loss + visual_loss + imitation_loss
                 losses.extend(segment_loss.cpu().tolist())
         return losses
 
@@ -2539,7 +2709,13 @@ class TorchBrain:
         with self.save_lock:
             training = self.training_throughput[self.train_memory is not None]
             metrics = {'world_models': 2 + len(self.q.world_models), 'transfer_ms': round(self.perf['transfer_ms'], 3), 'inference_ms': round(self.perf['inference_ms'], 3), 'training_samples_per_second': round(training, 2), 'batches': self.perf['batches'], 'training_examples': self.perf['training_examples'], 'visual_error': round(self.perf['visual_error'], 5), 'batch_size': self.batch_sizes[self.train_memory is not None], 'archive_count': self.archive.kept, 'archive_total_observed': self.archive.total, 'capacity_layers': len(self.q.growing), 'vision_layers': len(self.q.visual_growing), 'model_parameters': sum(parameter.numel() for parameter in self.q.parameters()), 'planning_trust': round(self.planning_trust, 3), 'world_model_ratio': round(self.planning_ratio, 3) if self.planning_ratio is not None else None}
+            if self.inference_durations:
+                timings = sorted(self.inference_durations)
+                metrics['inference_p95_ms'] = round(timings[int(.95 * (len(timings) - 1))], 3)
             if getattr(self.d, 'type', None) == 'cuda':
+                metrics['cuda_model_validated'] = True
+                metrics['cuda_optimizer_steps'] = self.cuda_optimizer_steps
+                metrics['cuda_prior_training_steps'] = max(0, self.grads - self.cuda_optimizer_steps)
                 try:
                     free, total = self.t.cuda.mem_get_info(self.d)
                     metrics['gpu_memory_used_gb'] = round((total - free) / 1073741824., 2)
@@ -2584,6 +2760,7 @@ class TorchBrain:
         return self.planning_trust
 
     def effect_metric(self, records):
+        records = [row for row in records if not (len(row) > 13 and row[13])]
         if not records:
             return None
         t = self.t
@@ -2656,7 +2833,7 @@ class TorchBrain:
                 return
             self.train_memory, validation, audit = split
             self.discount_rate = observed_discount_rate(self.train_memory)
-            self.grow_from_evidence(self.train_memory)
+            self.grow_from_evidence(self.train_memory, validation)
             labels = self.validation_targets(validation)
             audit_labels = self.validation_targets(audit)
             audit_losses = self.evaluation_losses(audit, audit_labels)
@@ -2843,7 +3020,23 @@ def validate_network(torch, engine, device):
             if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all().item()):
                 raise ValueError('神经网络反向计算产生非法梯度')
         if getattr(device, 'type', None) == 'cuda':
-            torch.cuda.synchronize(device)
+            target_parameter = next((p for p in model.parameters() if p.grad is not None and
+                                     bool(torch.count_nonzero(p.grad).item())), None)
+            if target_parameter is None:
+                raise ValueError('CUDA 模型计算未产生可供更新的梯度')
+            original_parameter = target_parameter.detach().clone()
+            try:
+                trial = torch.optim.AdamW((target_parameter,), lr=0.001)
+                trial.step()
+                torch.cuda.synchronize(device)
+                if not bool(torch.isfinite(target_parameter).all().item()):
+                    raise ValueError('CUDA 优化器产生非法参数')
+                if bool(torch.equal(original_parameter, target_parameter)):
+                    raise ValueError('CUDA 优化器未实际更新网络参数')
+            finally:
+                with torch.no_grad():
+                    target_parameter.copy_(original_parameter)
+                torch.cuda.synchronize(device)
     finally:
         model.zero_grad(set_to_none=True)
         model.eval()
@@ -3206,6 +3399,8 @@ class RemoteBrain:
             self.train_preempt.clear()
 
     def learn(self, ob, meta, action, nxt, nmeta, reward, done, dt, ctrl, intended, executed_action, efficacy, reserved=False, demonstration=False):
+        with self.save_lock:
+            ob = coalesce_observation(self.memory, ob)
         data = (ob, tuple(meta), int(action), nxt, tuple(nmeta), float(reward), bool(done), float(dt), tuple(ctrl), tuple(intended), int(executed_action), float(efficacy), bool(reserved), bool(demonstration))
         self.inference_pending.set()
         self.train_preempt.set()
@@ -3386,6 +3581,9 @@ if os.name == 'nt':
     class RECT(ctypes.Structure):
         _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long), ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
 
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [('cbSize', wintypes.UINT), ('dwTime', wintypes.DWORD)]
+
     class BITMAPINFOHEADER(ctypes.Structure):
         _fields_ = [('biSize', wintypes.DWORD), ('biWidth', ctypes.c_long), ('biHeight', ctypes.c_long), ('biPlanes', wintypes.WORD), ('biBitCount', wintypes.WORD), ('biCompression', wintypes.DWORD), ('biSizeImage', wintypes.DWORD), ('biXPelsPerMeter', ctypes.c_long), ('biYPelsPerMeter', ctypes.c_long), ('biClrUsed', wintypes.DWORD), ('biClrImportant', wintypes.DWORD)]
 
@@ -3426,6 +3624,8 @@ if os.name == 'nt':
     u.WindowFromPoint.restype = wintypes.HWND
     u.GetAsyncKeyState.argtypes = (ctypes.c_int,)
     u.GetAsyncKeyState.restype = ctypes.c_short
+    u.GetLastInputInfo.argtypes = (ctypes.POINTER(LASTINPUTINFO),)
+    u.GetLastInputInfo.restype = wintypes.BOOL
     u.OpenInputDesktop.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     u.OpenInputDesktop.restype = wintypes.HANDLE
     u.GetThreadDesktop.argtypes = (wintypes.DWORD,)
@@ -3452,6 +3652,7 @@ if os.name == 'nt':
     u.PostThreadMessageW.argtypes = (wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    kernel32.GetTickCount64.restype = ctypes.c_ulonglong
     kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
@@ -3521,12 +3722,62 @@ def window_fingerprint(hwnd, title):
     return (classname.value.casefold() + '|' + identity) if classname.value else identity
 
 
+def migrate_default_data(source, destination):
+    source = Path(source)
+    destination = Path(destination)
+    if not source.exists():
+        return False
+    old, new = source.resolve(), destination.resolve()
+    if old == new or old in new.parents or new in old.parents:
+        return False
+    if destination.exists() and any(destination.iterdir()):
+        return False
+    entries = list(source.iterdir())
+    if not entries:
+        return False
+    destination.mkdir(parents=True, exist_ok=True)
+    moved = []
+    try:
+        for entry in entries:
+            target = destination / entry.name
+            if target.exists():
+                raise FileExistsError(str(target))
+            shutil.move(str(entry), str(target))
+            moved.append((entry, target))
+    except (OSError, shutil.Error):
+        for original, relocated in reversed(moved):
+            try:
+                shutil.move(str(relocated), str(original))
+            except (OSError, shutil.Error):
+                pass
+        raise
+    try:
+        source.rmdir()
+    except OSError:
+        pass
+    return True
+
+
 def environment_for(folder, hwnd, display_name):
     descriptor = display_name.rsplit('  [0x', 1)[0].strip().casefold()
     descriptor = window_fingerprint(hwnd, descriptor)
     digest = hashlib.sha256(descriptor.encode('utf-8')).digest()
     code = tuple((int.from_bytes(digest[i:i + 4], 'little') / 4294967295.) * 2. - 1. for i in (0, 4))
     return Path(folder) / 'environments' / digest.hex()[:24], code
+
+
+def system_idle_seconds():
+    if os.name != 'nt':
+        return None
+    try:
+        record = LASTINPUTINFO()
+        record.cbSize = ctypes.sizeof(record)
+        if not u.GetLastInputInfo(ctypes.byref(record)):
+            return None
+        elapsed = ((int(kernel32.GetTickCount64()) & 0xffffffff) - int(record.dwTime)) & 0xffffffff
+        return elapsed / 1000. if elapsed < 0x80000000 else None
+    except (OSError, AttributeError, ValueError):
+        return None
 
 
 def interactive_desktop():
@@ -3601,6 +3852,10 @@ class WindowsIO:
         self.io_lock = threading.RLock()
         self.keyboard_guard = None
         self.human_guard = None
+        self.user_override = threading.Event()
+        self.input_generation = -1
+        self.input_generation_guard = None
+        self.exploration_targets = ()
         self.velocity = (0., 0.)
         self.motion_scale = 1.
         self.grabber = None
@@ -3761,6 +4016,7 @@ class WindowsIO:
             return self.target_cache
         x, y, width, height = region
         found = []
+        explorables = []
         def visit(child, extra):
             try:
                 if not u.IsWindowVisible(child) or not u.IsWindowEnabled(child):
@@ -3780,15 +4036,31 @@ class WindowsIO:
                 center_x, center_y = (left + right) / 2, (top + bottom) / 2
                 if x + 3 < center_x < x + width - 3 and y + 3 < center_y < y + height - 3:
                     found.append(((center_x - x) / width, (center_y - y) / height, 2 if 'button' in category or 'link' in category else 1))
+                    if any(tag in category for tag in ('button', 'tabcontrol', 'link')):
+                        explorables.append((left, top, right, bottom, 'click'))
+                    elif any(tag in category for tag in ('scrollbar', 'listbox', 'listview', 'treeview')):
+                        explorables.append((left, top, right, bottom, 'scroll'))
             except (OSError, ValueError):
                 pass
             return True
         callback = WNDPROC(visit)
         u.EnumChildWindows(self.hwnd, callback, 0)
         self.target_cache = tuple(found)
+        self.exploration_targets = tuple(explorables)
         self.target_region = region
         self.target_scan_at = now + interval
         return self.target_cache
+
+    def explorable_controls(self, position, held):
+        px, py = position
+        result = set()
+        for left, top, right, bottom, kind in self.exploration_targets:
+            if left <= px < right and top <= py < bottom:
+                if kind == 'click' and not held.get('l', False):
+                    result.add(BUTTON_ACTIONS[('l', True)])
+                if kind == 'scroll':
+                    result.update(SCROLL_ACTIONS)
+        return result
 
     def visible_targets(self, frame):
         if frame is None or len(frame) != VIS_N:
@@ -4082,7 +4354,14 @@ class WindowsIO:
         finally:
             self.post_action_capture = False
 
+    def input_stop(self, stop):
+        return AnyStop(stop, self.halted, self.user_override, InputLeaseStop(self))
+
     def safe(self, region, stop, require_pointer=True):
+        if self.input_generation_guard is not None and not self.input_generation_guard(self.input_generation):
+            raise InterruptedError('本轮 AI 控制许可已被真实输入撤销')
+        if self.user_override.is_set():
+            raise InterruptedError('检测到真实输入，暂停 AI 鼠标控制')
         if self.keyboard_guard is not None and not self.keyboard_guard.is_set():
             raise RuntimeError('输入急停监控暂不可用，禁止发送鼠标指令')
         if self.human_guard is not None and not self.human_guard():
@@ -4107,8 +4386,8 @@ class WindowsIO:
             px, py = self.cursor()
             if not (x + 3 <= px < x + w - 3 and y + 3 <= py < y + h - 3) or not self.pointer_on_target(px, py):
                 self.safe(region, stop, False)
-                send_cursor(x + w // 2, y + h // 2, AnyStop(stop, self.halted))
-                ensure_cursor(x + w // 2, y + h // 2, .2, stop)
+                send_cursor(x + w // 2, y + h // 2, self.input_stop(stop))
+                ensure_cursor(x + w // 2, y + h // 2, .2, self.input_stop(stop))
             self.safe(region, stop)
             self.last_ai_cursor = self.cursor()
             self.velocity = (0., 0.)
@@ -4127,7 +4406,7 @@ class WindowsIO:
             if stop is not None and stop.is_set():
                 raise InterruptedError('键盘急停')
             self.release_uncertain = True
-            send_mouse(flags[name][0 if press else 1], stop=AnyStop(stop, self.halted) if stop is not None else self.halted)
+            send_mouse(flags[name][0 if press else 1], stop=self.input_stop(stop) if stop is not None else self.input_stop(self.halted))
             self.down[name] = press
             self.release_uncertain = False
             if press:
@@ -4196,8 +4475,8 @@ class WindowsIO:
             if stop.is_set():
                 raise InterruptedError('键盘急停')
             if (nx, ny) != (px, py):
-                send_cursor(nx, ny, AnyStop(stop, self.halted))
-                ensure_cursor(nx, ny, max(.03, min(.2, dt + self.last_capture_ms / 1000.)), stop)
+                send_cursor(nx, ny, self.input_stop(stop))
+                ensure_cursor(nx, ny, max(.02, min(.1, dt + self.last_capture_ms / 1000.)), self.input_stop(stop))
             self.safe(region, stop)
             ex, ey = self.cursor()
             dx, dy = ex - px, ey - py
@@ -4245,7 +4524,7 @@ class WindowsIO:
                 if abs(self.scroll_credit) >= 1.:
                     self.safe(region, stop)
                     delta = 120 if self.scroll_credit > 0. else -120
-                    send_mouse(0x0800, delta, stop=AnyStop(stop, self.halted))
+                    send_mouse(0x0800, delta, stop=self.input_stop(stop))
                     self.scroll_credit -= math.copysign(1., self.scroll_credit)
             action = observed_action(dx, dy, dt, speed_limit, wheel, delta, switches)
             real_speed = min(1., math.hypot(dx, dy) / (dt * speed_limit))
@@ -4320,7 +4599,11 @@ def detect_gpu():
                 if not display(None, i, ctypes.byref(item), 0):
                     break
                 name = item.DeviceString.strip()
-                if name and name not in names and not any(x in name.lower() for x in ('basic display', 'remote display', 'mirror driver')):
+                if not name or any(x in name.lower() for x in ('basic display', 'remote display', 'mirror driver')):
+                    continue
+                if 'ven_10de' in item.DeviceID.lower() and 'nvidia' not in name.lower():
+                    name = 'NVIDIA ' + name
+                if name not in names:
                     names.append(name)
         except Exception:
             pass
@@ -4588,7 +4871,9 @@ def nvidia_driver_info():
 def nvidia_compute_capabilities():
     if os.name != 'nt':
         return []
-    for binary in ('nvidia-smi', str(Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'System32' / 'nvidia-smi.exe')):
+    binaries = ('nvidia-smi', str(Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'System32' / 'nvidia-smi.exe'),
+                str(Path(os.environ.get('ProgramFiles', 'C:/Program Files')) / 'NVIDIA Corporation' / 'NVSMI' / 'nvidia-smi.exe'))
+    for binary in binaries:
         try:
             check = subprocess.run([binary, '--query-gpu=name,compute_cap', '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=7, creationflags=subprocess.CREATE_NO_WINDOW)
             if check.returncode == 0 and check.stdout.strip():
@@ -4677,6 +4962,21 @@ def available_cuda_wheels(driver, cancel=None, runtime_folder=None):
     return supported
 
 
+def gpu_failure_category(detail):
+    message = str(detail).lower()
+    if any(part in message for part in ('out of memory', 'cuda error: out of memory', 'not enough memory', '显存')):
+        return '显存不足'
+    if any(part in message for part in ('no kernel image', 'unsupported gpu', 'sm_', 'invalid device function')):
+        return '显卡架构与计算包不兼容'
+    if any(part in message for part in ('driver', 'dll load failed', 'nvcuda', '驱动')):
+        return '显卡驱动或设备初始化失败'
+    if any(part in message for part in ('no module named', 'module not found', 'importerror', 'winerror 126', '动态链接')):
+        return '运行时依赖不完整'
+    if any(part in message for part in ('timed out', 'timeout', 'connection', '网络')):
+        return '下载或验证通信失败'
+    return 'GPU 实际运算验证失败'
+
+
 def load_brain(folder, report, cancel, runtime_folder=None, gpu_only=False, cuda_only=False):
     folder.mkdir(parents=True, exist_ok=True)
     runtime_folder = Path(runtime_folder) if runtime_folder is not None else folder
@@ -4733,7 +5033,7 @@ def load_brain(folder, report, cancel, runtime_folder=None, gpu_only=False, cuda
                         pass
                 return ready
             except Exception as error:
-                detail = backend + ' (' + (runtime.name if runtime else '系统运行时') + ')：' + str(error)[:180]
+                detail = backend + ' (' + (runtime.name if runtime else '系统运行时') + ') [' + gpu_failure_category(error) + ']：' + str(error)[:180]
                 failures.append(detail)
                 if not cancel.is_set():
                     if backend in ('cuda', 'directml'):
@@ -4912,14 +5212,18 @@ class MouseAIApp:
         self.root.minsize(min(500, work_width), min(360, work_height))
         home = Path.home()
         self.folder = (home / 'Documents' / 'MouseAI') if (home / 'Documents').exists() else (home / 'MouseAI')
-        self.folder_explicit = False
+        self.folder_origin_default = True
         self.hardware_probe_thread = None
         self.control_stop = threading.Event()
         self.observer_stop = threading.Event()
         self.human_lock = threading.RLock()
+        self.user_override = threading.Event()
+        self.user_override.set()
         self.takeover_permission = threading.Event()
         self.takeover_window = None
         self.takeover_check = tk.BooleanVar(value=False)
+        self.explore_check = tk.BooleanVar(value=False)
+        self.explore_permission = threading.Event()
         self.human_last_input = time.monotonic()
         self.human_gaps = deque(maxlen=256)
         self.human_events = deque(maxlen=4096)
@@ -5049,7 +5353,10 @@ class MouseAIApp:
         tk.Label(self.root, text='用户操作时仅观察学习；授权后且目标窗口位于前台时，空闲可自主使用鼠标。真实输入立即中断。', bg='#10131a', fg='#9de1d5', anchor='w', justify='left', wraplength=max(280, self.root.winfo_screenwidth() - 80), font=('Microsoft YaHei UI', 9)).pack(fill='x', padx=16, pady=(5, 2))
         tk.Checkbutton(self.root, text='允许 AI 在所选窗口无人值守时自主使用鼠标（初始关闭）', variable=self.takeover_check,
                        command=self.change_takeover_permission, bg='#10131a', fg='#f3d9a4', selectcolor='#303949',
-                       activebackground='#10131a', activeforeground='#f3d9a4', anchor='w', font=('Microsoft YaHei UI', 9, 'bold')).pack(fill='x', padx=16, pady=(0, 5))
+                       activebackground='#10131a', activeforeground='#f3d9a4', anchor='w', font=('Microsoft YaHei UI', 9, 'bold')).pack(fill='x', padx=16, pady=(0, 2))
+        tk.Checkbutton(self.root, text='允许探索性点击标准控件及滚动（可能改变窗口内容，默认关闭）', variable=self.explore_check,
+                       command=self.change_explore_permission, bg='#10131a', fg='#e3c6ae', selectcolor='#303949',
+                       activebackground='#10131a', activeforeground='#e3c6ae', anchor='w', font=('Microsoft YaHei UI', 9)).pack(fill='x', padx=16, pady=(0, 5))
         lower = tk.Frame(self.root, bg='#10131a')
         lower.pack(side='bottom', fill='x', padx=16, pady=(3, 5))
         tk.Label(lower, text='任意真实键盘或鼠标操作都能立即打断 AI；关闭窗口即可退出', bg='#10131a', fg='#ffbb85', anchor='w', font=('Microsoft YaHei UI', 9, 'bold')).pack(fill='x', pady=(0, 3))
@@ -5173,6 +5480,18 @@ class MouseAIApp:
             threading.Thread(target=measure, daemon=True).start()
         self.root.after(3000, self.report_storage)
 
+    def change_explore_permission(self):
+        if self.explore_check.get():
+            self.explore_permission.set()
+            self.status.set('探索性点击已授权；仅选定窗口的标准按钮/标签/链接，点击可能修改窗口数据')
+        else:
+            self.explore_permission.clear()
+            self.status.set('探索性点击已关闭；保留已示范动作与移动学习')
+
+    def input_generation_current(self, generation):
+        with self.human_lock:
+            return self.human_event_id == generation and not self.user_override.is_set()
+
     def change_takeover_permission(self):
         selected = self.listing.get(self.combo_var.get())
         if self.takeover_check.get() and selected is not None:
@@ -5246,6 +5565,7 @@ class MouseAIApp:
     def human_input(self, mouse_event=None, keyboard=False):
         now = time.monotonic()
         with self.human_lock:
+            self.user_override.set()
             elapsed = now - self.human_last_input
             if elapsed > .5:
                 self.human_gaps.append(elapsed)
@@ -5258,22 +5578,34 @@ class MouseAIApp:
             self.release_signal.set()
             if keyboard:
                 self.keyboard_stopped_control.set()
-                self.emergency_stop('检测到真实键盘输入，已停止鼠标控制')
+                self.emergency_stop('检测到真实键盘输入，已停止鼠标控制', fast=True)
             else:
                 self.control_state = '安全暂停'
                 self.control_heartbeat = 0.
 
     def idle_delay(self):
-        with self.human_lock:
-            gaps = sorted(g for g in self.human_gaps if g > .5)
-        learned = gaps[min(len(gaps) - 1, int(.90 * len(gaps)))] if gaps else 0.
         double_click = float(u.GetDoubleClickTime()) / 1000. if os.name == 'nt' else .5
-        return max(25., min(180., max(learned * 4., double_click * 80.)))
+        baseline = max(double_click * 32., time.get_clock_info('monotonic').resolution)
+        with self.human_lock:
+            gaps = sorted(g for g in self.human_gaps if g > double_click)
+        if len(gaps) < max(4, math.isqrt(self.human_gaps.maxlen)):
+            return baseline
+        center = gaps[len(gaps) // 2]
+        deviation = sorted(abs(value - center) for value in gaps)[len(gaps) // 2]
+        typical_pause = center + 3. * deviation
+        return max(baseline, min(typical_pause, gaps[int(.9 * (len(gaps) - 1))]))
 
     def human_idle(self):
         with self.human_lock:
             last = self.human_last_input
-        return time.monotonic() - last >= self.idle_delay()
+        timeout = self.idle_delay()
+        if time.monotonic() - last < timeout:
+            return False
+        if self.mode != 'control':
+            observed = system_idle_seconds()
+            if observed is None or observed < timeout:
+                return False
+        return True
 
     def takeover_allowed(self):
         if (os.name != 'nt' or not self.takeover_permission.is_set() or
@@ -5284,9 +5616,26 @@ class MouseAIApp:
             return False
         try:
             tracked = self.active_io.down if self.mode == 'control' and self.active_io is not None else {}
-            return (interactive_desktop() and int(u.GetForegroundWindow() or 0) == int(self.session_hwnd or 0) and
-                    not any(u.GetAsyncKeyState(vk) & 0x8000 for name, vk in (('l', 1), ('r', 2), ('m', 4)) if not tracked.get(name, False)) and
-                    not any(u.GetAsyncKeyState(vk) & 0x8000 for vk in (5, 6)))
+            eligible = (interactive_desktop() and int(u.GetForegroundWindow() or 0) == int(self.session_hwnd or 0) and
+                        not any(u.GetAsyncKeyState(vk) & 0x8000 for name, vk in (('l', 1), ('r', 2), ('m', 4)) if not tracked.get(name, False)) and
+                        not any(u.GetAsyncKeyState(vk) & 0x8000 for vk in (5, 6)) and
+                        not any(u.GetAsyncKeyState(vk) & 0x8000 for vk in range(7, 256)))
+            if not eligible:
+                return False
+            with self.human_lock:
+                delay = self.idle_delay()
+                if time.monotonic() - self.human_last_input < delay:
+                    return False
+                if self.mode != 'control':
+                    system_idle = system_idle_seconds()
+                    if system_idle is None or system_idle < delay:
+                        return False
+                if not self.keyboard_ready.is_set() or self.control_stop.is_set() or self.exit_stop.is_set():
+                    return False
+                self.user_override.clear()
+                if self.active_io is not None:
+                    self.active_io.input_generation = self.human_event_id
+                return True
         except (OSError, ValueError, AttributeError):
             return False
 
@@ -5384,9 +5733,6 @@ class MouseAIApp:
                     self.post('status', '人工学习等待中：只观察已选择且处于前台的窗口；人仍在操作时绝不改变窗口焦点')
                     stop.wait(.15)
                     continue
-                with self.human_lock:
-                    events = tuple(event for event in self.human_events if event[0] > prior_id)
-                    current_event_id = self.human_event_id
                 started = time.monotonic()
                 self.control_interval = max(device.display_period, device.last_capture_ms / 1000., started - last_action_time)
                 try:
@@ -5395,49 +5741,67 @@ class MouseAIApp:
                         previous = None
                         stop.wait(max(.03, device.display_period))
                         continue
+                    frame_stamp = device.last_capture_stamp
+                    if previous is not None and frame_stamp <= last_action_time:
+                        stop.wait(max(.015, device.display_period))
+                        continue
                     cursor = device.cursor()
                     held = device.keys()
+                    with self.human_lock:
+                        pending = tuple(event for event in self.human_events if event[0] > prior_id)
+                    events = tuple(event for event in pending if event[1] <= frame_stamp)
+                    current_event_id = events[-1][0] if events else prior_id
+                    if any(event[1] > frame_stamp for event in pending):
+                        stop.wait(max(.015, device.display_period))
+                        continue
                     if started - self.preview_at > max(.3, device.last_capture_ms / 1000. * 3):
                         self.preview_at = started
                         self.post('preview', frame)
                     if previous is not None and events:
-                        old_frame, old_cursor, old_held, old_meta, old_region = previous
-                        if region == old_region:
-                            aligned = [event for event in events if last_action_time <= event[1] <= started]
-                            elapsed = max(sys.float_info.epsilon, started - last_action_time)
+                        old_frame, old_cursor, old_held, old_meta, old_region, old_epoch = previous
+                        if region == old_region and device.capture_epoch == old_epoch:
+                            aligned = [event for event in events if last_action_time < event[1] <= frame_stamp]
+                            elapsed = max(sys.float_info.epsilon, frame_stamp - last_action_time)
                             samples = demonstration_from_events(old_cursor, cursor, old_held, held, aligned, region, elapsed)
                             if samples:
-                                credited = next((i for i in range(len(samples) - 1, -1, -1) if not any(s.endswith('-') for s in samples[i][3])), len(samples) - 1)
-                                credit_action, credit_ctrl, credit_distance, credit_switches, credit_scroll = samples[credited][:5]
-                                result = {'action': credit_action, 'ctrl': credit_ctrl, 'changed': True, 'moved': credit_distance,
-                                          'efficacy': 1., 'switches': credit_switches, 'blocked': False,
-                                          'pending_scroll': False, 'scroll': credit_scroll}
-                                measured, change, advanced = observation_feedback.assess(old_frame, frame, old_frame, result, cursor, region)
-                                reward = max(-1., min(1., measured))
-                                image_before = old_frame
-                                meta_before = old_meta
-                                cursor_before = old_cursor
+                                isolated = len(samples) == 1 and len(aligned) == 1 and frame_stamp > aligned[0][1]
+                                reward = 0.
+                                change = 0.
+                                advanced = False
+                                if isolated:
+                                    action, control, distance, transitions, scroll, duration, position, down = samples[0]
+                                    outcome = {'action': action, 'ctrl': control, 'changed': bool(distance or transitions or scroll),
+                                               'moved': distance, 'efficacy': 1., 'switches': transitions, 'blocked': False,
+                                               'pending_scroll': False, 'scroll': scroll}
+                                    reward, change, advanced = observation_feedback.assess(old_frame, frame, old_frame, outcome, cursor, region)
+                                    reward = max(-1., min(1., reward))
+                                    if demonstration_atlas is not None:
+                                        demonstration_atlas.observe(old_frame, action, frame, reward, 1., advanced, True)
                                 sample_time = last_action_time
-                                for i, (action, control, distance, transitions, scroll, duration, position, down) in enumerate(samples):
-                                    sample_time = min(started, sample_time + duration)
-                                    image_after = frame if i >= credited else old_frame
-                                    effect = reward if i == credited else 0.
-                                    new_meta = self.create_meta(sample_time, region, position, cursor_before, down, scroll, duration, change if i == credited else 0.)
-                                    self.brain.learn(image_before, meta_before, action, image_after, new_meta, effect, False, duration,
+                                previous_cursor = old_cursor
+                                meta_before = old_meta
+                                for action, control, distance, transitions, scroll, duration, position, down in samples:
+                                    sample_time = min(frame_stamp, sample_time + duration)
+                                    new_meta = self.create_meta(sample_time, region, position, previous_cursor, down, scroll, duration, change if isolated else 0.)
+                                    self.brain.learn(old_frame, meta_before, action, frame if isolated else old_frame,
+                                                     new_meta, reward if isolated else 0., True, duration,
                                                      control, control, action, 1., False, True)
-                                    if i == credited and demonstration_atlas is not None:
-                                        demonstration_atlas.observe(image_before, action, image_after, reward, 1., advanced, True)
-                                    self.control_history.append((control[0] * control[2], control[1] * control[2], control[6], effect))
+                                    self.control_history.append((control[0] * control[2], control[1] * control[2], control[6], reward if isolated else 0.))
                                     self.observed_count += 1
-                                    image_before, meta_before, cursor_before = image_after, new_meta, position
+                                    meta_before = new_meta
+                                    previous_cursor = position
                                 if self.observed_count % max(2, math.isqrt(max(1, self.observed_count))) < len(samples):
-                                    self.post('stats', f'人工示范 {self.observed_count} 条 · 短期经验 {len(self.brain.memory)} · 自主操作 {self.iterations} 次 · 已按事件拆分混合动作')
+                                    reliable = '已采集单动作前后截图' if isolated else '连续动作仅模仿学习，未虚构动作结果'
+                                    self.post('stats', f'人工示范 {self.observed_count} 条 · 短期经验 {len(self.brain.memory)} · 自主操作 {self.iterations} 次 · {reliable}')
                                     self.post('control', f'正在学习人工鼠标示范：分解 {len(samples)} 步 · 鼠标键变化 {sum(bool(part[3]) for part in samples)} · 滚轮 {sum(part[4] for part in samples):+d}')
+                                    perf = self.brain.latest_perf if isinstance(self.brain, RemoteBrain) else {}
+                                    if perf and self.brain.engine_backend == 'cuda':
+                                        self.post('gpu_state', self.brain.label + (' · CUDA训练已实际执行' if perf.get('cuda_optimizer_steps', 0) else ' · CUDA模型已验证，正在等待训练') + f' · 累计训练 {perf.get("training_examples", 0)} 样本')
                     old_pos = previous[1] if previous is not None and previous[4] == region else cursor
-                    old_dt = max(sys.float_info.epsilon, started - last_action_time)
-                    meta = self.create_meta(started, region, cursor, old_pos, held, 0, old_dt, 0.)
-                    previous = (frame, cursor, held, meta, region)
-                    last_action_time = started
+                    old_dt = max(sys.float_info.epsilon, frame_stamp - last_action_time)
+                    meta = self.create_meta(frame_stamp, region, cursor, old_pos, held, 0, old_dt, 0.)
+                    previous = (frame, cursor, held, meta, region, device.capture_epoch)
+                    last_action_time = frame_stamp
                     prior_id = current_event_id
                     if not ready_reported:
                         ready_reported = True
@@ -5521,7 +5885,9 @@ class MouseAIApp:
                 if not self.task_failed:
                     self.set_progress(*val)
             elif kind == 'folder_changed':
-                folder = Path(val)
+                folder, transferred = val
+                folder = Path(folder)
+                self.folder_origin_default = False
                 self.folder = folder
                 self.data_folder = folder
                 self.folder_text.set(str(folder))
@@ -5530,7 +5896,7 @@ class MouseAIApp:
                 self.issue.set('无')
                 self.task_failed = False
                 self.phase.set('空闲')
-                self.status.set('已切换数据目录，旧数据保存完成')
+                self.status.set('已切换数据目录，旧经验与运行时已迁移' if transferred else '已切换数据目录，原有目录独立保留')
                 self.switching_folder = False
                 self.mode = 'idle'
                 self.set_progress(100, '文件夹切换完成')
@@ -5700,7 +6066,6 @@ class MouseAIApp:
         if not new:
             return
         folder = Path(new)
-        self.folder_explicit = True
         self.revoke_takeover_permission()
         if self.mode == 'observe':
             self.pending_folder = folder
@@ -5717,6 +6082,8 @@ class MouseAIApp:
         if any(worker is not None and worker.is_alive() for worker in (self.worker, self.online_worker)):
             self.status.set('控制线程仍在退出，请稍后更换目录')
             return
+        source_folder = self.folder
+        migrate_on_switch = self.folder_origin_default
         self.task_failed = False
         self.selected_key = ''
         self.switching_folder = True
@@ -5755,7 +6122,14 @@ class MouseAIApp:
                 self.backend_faults = {}
                 self.audit_sum = 0.
                 self.audit_samples = 0
-                self.post('folder_changed', str(folder))
+                transferred = False
+                if migrate_on_switch and not self.exit_stop.is_set():
+                    self.post('progress', (85., '切换 3/3 · 整理默认数据目录'))
+                    try:
+                        transferred = migrate_default_data(source_folder, folder)
+                    except (OSError, shutil.Error) as error:
+                        self.post('status', '原目录数据未迁移，已保留原始文件：' + str(error)[:95])
+                self.post('folder_changed', (str(folder), transferred))
             except Exception as error:
                 self.post('folder_failed', str(error)[:170])
         self.worker = threading.Thread(target=transition, daemon=True)
@@ -6106,17 +6480,18 @@ class MouseAIApp:
         finally:
             self.backend_recovering.clear()
 
-    def emergency_stop(self, reason):
+    def emergency_stop(self, reason, fast=False):
+        self.user_override.set()
         self.control_stop.set()
         self.release_signal.set()
         self.control_state = '已停止'
         self.mouse_monitor_armed.clear()
         self.control_heartbeat = 0.
         self.online_stop.set()
-        if isinstance(self.brain, RemoteBrain):
+        if not fast and isinstance(self.brain, RemoteBrain):
             self.brain.cancel_train()
         active = self.active_io
-        if active is not None and (self.release_worker is None or not self.release_worker.is_alive()):
+        if not fast and active is not None and (self.release_worker is None or not self.release_worker.is_alive()):
             def release_now():
                 error = None
                 for attempt in range(3):
@@ -6151,7 +6526,7 @@ class MouseAIApp:
                     train_count = sum(not row[12] for row in brain.memory)
                 if train_count >= 2:
                     if isinstance(brain, RemoteBrain) and brain.inference_interval and brain.online_train_cost >= max(0., brain.inference_interval - brain.recent_inference_cost):
-                        self.online_stop.wait(max(.03, brain.inference_interval * 2.))
+                        self.online_stop.wait(max(brain.inference_interval, brain.online_train_cost, brain.recent_inference_cost))
                     else:
                         brain.train(1, self.online_stop)
             except Exception as ex:
@@ -6301,14 +6676,14 @@ class MouseAIApp:
                     except Exception as error:
                         self.emergency_stop('无法确认鼠标按键已释放：' + str(error)[:90])
             if self.control_stop.is_set():
-                if not canceled and isinstance(self.brain, RemoteBrain):
-                    self.brain.cancel_train()
-                canceled = True
                 if active is not None and (any(active.down.values()) or active.release_uncertain):
                     try:
                         active.halt()
                     except Exception:
                         pass
+                if not canceled and isinstance(self.brain, RemoteBrain):
+                    self.brain.cancel_train()
+                canceled = True
             else:
                 canceled = False
         active = self.active_io
@@ -6362,7 +6737,7 @@ class MouseAIApp:
                             delta = ctypes.c_short((event.mouseData >> 16) & 0xffff).value if kind == 0x20A else 0
                             self.human_input((key, int(event.pt.x), int(event.pt.y), delta))
                     except Exception:
-                        pass
+                        self.human_input()
                 return u.CallNextHookEx(None, code, wparam, lparam)
             key_callback = KBDPROC(pressed)
             mouse_callback = MSPROC(scrolled)
@@ -6523,8 +6898,10 @@ class MouseAIApp:
         feedback = Feedback()
         planner = None
         demonstrated_brain = None
-        demonstrated = set()
+        demonstrated = {}
+        demonstration_targets = {}
         navigator = TargetNavigator()
+        exploration = ExplorationEvidence()
         infer_times = deque(maxlen=96)
         capture_times = deque(maxlen=96)
         frame_times = deque(maxlen=96)
@@ -6546,6 +6923,7 @@ class MouseAIApp:
                 try:
                     io = WindowsIO(hwnd)
                     io.keyboard_guard = self.keyboard_ready
+                    io.input_generation_guard = self.input_generation_current
                 except (OSError, RuntimeError, ValueError) as error:
                     self.post('phase', '等待截图设备')
                     self.post('status', '正在恢复鼠标或截图设备：' + str(error)[:90] + '；按任意键停止')
@@ -6554,6 +6932,7 @@ class MouseAIApp:
                 return
             self.post('progress', (75, '初始化 3/4 · 截图设备已创建，急停保护已配置'))
             io.human_guard = self.human_idle
+            io.user_override = self.user_override
             self.active_io = io
             if not self.takeover_allowed():
                 self.post('status', '用户正在操作，已暂停接管；用户空闲后自动继续')
@@ -6592,7 +6971,7 @@ class MouseAIApp:
             self.post('progress', (100, '初始化 4/4 · 已验证首帧及控制安全条件'))
             self.control_state = '控制中'
             self.post('phase', 'AI 控制中')
-            self.post('status', '正在执行已授权的鼠标动作；未示范时只在可观察目标上尝试左键，真实鼠标输入会暂停，任意键盘按键停止')
+            self.post('status', '无示范时默认仅移动；单独授权后可有限探索标准控件。真实输入可立即中断')
             while not stop.is_set():
                 try:
                     if not self.human_idle():
@@ -6753,11 +7132,22 @@ class MouseAIApp:
                         raise RuntimeError('模型动作参数异常')
                     if demonstrated_brain is not self.brain:
                         with self.brain.save_lock:
-                            demonstrated = {row[2] for row in self.brain.memory if len(row) > 13 and row[13] and not row[12]}
+                            demonstrated = demonstrated_controls(self.brain.memory)
+                        demonstration_targets = demonstrated_target_cells(demonstrated)
                         demonstrated_brain = self.brain
-                    proximity = max(math.hypot(region[2] / VIS_W, region[3] / VIS_H), 1.)
-                    click_target = any(quality > 0. and math.hypot((float(tx) - meta[4]) * region[2], (float(ty) - meta[5]) * region[3]) <= proximity * 2. for tx, ty, quality in suggested_targets)
-                    action, ctrl = permitted_autonomous_control(action, ctrl, demonstrated, io.down, click_target)
+                    permitted = matching_demonstrations(demonstrated, frame, meta)
+                    exploratory = (exploration.allowable(frame, meta, io.explorable_controls(mouse, io.down), io.down)
+                                   if self.explore_permission.is_set() and self.takeover_permission.is_set() else set())
+                    if exploration.pending_release:
+                        if io.down.get('l', False):
+                            action = BUTTON_ACTIONS[('l', False)]
+                            ctrl = anchor_control(action)
+                        exploration.pending_release = False
+                    elif exploratory and not permitted and not any(io.down.values()):
+                        action, ctrl = exploration.choose(action, ctrl, exploratory, feedback)
+                    action, ctrl = permitted_autonomous_control(action, ctrl, permitted, io.down, exploratory)
+                    if action == BUTTON_ACTIONS[('l', True)] and action in exploratory and action not in permitted:
+                        exploration.pending_release = True
                     if not self.takeover_allowed():
                         raise InterruptedError('用户正在使用鼠标或无人值守授权已失效')
                     if not self.mouse_monitor_armed.is_set():
@@ -6816,7 +7206,10 @@ class MouseAIApp:
                     if planner is not None and planner.current_goal is not None:
                         outcome['goal_reached'] = (planner.signature(nxt) == planner.current_goal and planner.signature(frame) != planner.current_goal)
                         outcome['goal_demonstrated'] = planner.current_goal_demonstrated
+                    if action in MOTION_ACTIONS and outcome['moved'] > 0.:
+                        outcome['demonstration_progress'] = demonstrated_pointer_gain(demonstration_targets, frame, mouse, new_mouse, region)
                     reward, change, advanced = feedback.assess(frame, nxt, reference_frame, outcome, new_mouse, region)
+                    exploration.observe(action, frame, nxt, outcome)
                     navigator.observe(reward, outcome)
                     if planner is not None:
                         planner.observe(frame, action, nxt, reward, outcome['efficacy'], advanced)
@@ -6872,6 +7265,9 @@ class MouseAIApp:
                                 gpu_training += f' · 实时推理优先跳过训练 {self.brain.online_train_deferrals} 次'
                         if perf and 'gpu_memory_total_gb' in perf:
                             gpu_training += f' · 显存 {perf["gpu_memory_used_gb"]:.2f}/{perf["gpu_memory_total_gb"]:.2f}GB'
+                        if perf and perf.get('cuda_model_validated'):
+                            gpu_training += f' · CUDA参数更新 {perf.get("cuda_optimizer_steps", 0)} 次'
+                            self.post('gpu_state', self.brain.label + (' · CUDA训练已实际执行' if perf.get('cuda_optimizer_steps', 0) else ' · CUDA模型前后向验证通过，正在等待训练数据') + f' · 累计训练 {perf.get("training_examples", 0)} 样本')
                         if perf and 'capacity_layers' in perf:
                             gpu_training += f' · 思维层 {perf["capacity_layers"]} · 视觉层 {perf.get("vision_layers", 0)} · 参数 {perf["model_parameters"]:,} · 世界模型 {perf.get("world_models", 2)} 个'
                             if 'visual_error' in perf:
@@ -6891,7 +7287,7 @@ class MouseAIApp:
                         archived = archive.kept if archive is not None else perf.get('archive_count', '后台保存')
                         self.post('goal', planner.description if planner is not None else '目标规划未启动')
                         archival_health = (f' · 归档排队 {archive.pending.qsize()} · 溢出未归档 {archive.dropped} · 写盘P95 {p95(archive.write_ms):.1f}ms · 排队P95 {p95(archive.queue_ms):.1f}ms' + (' · 归档异常 ' + archive.error[:65] if archive.error else '')) if archive is not None else ''
-                        self.post('stats', f'短期经验 {len(self.brain.memory)} · 长期经验 {archived} · 操作 {self.iterations} · 可控进展 {feedback.progress_effects}/{feedback.total} · 重复可归因 {feedback.causal_evidence} · 循环 {feedback.loop_count} · 预测误差 {prediction:.3f} · 因果证据强度 {causal:.2f} · 被动基线 {feedback.passive_count} 次 · 受阻 {feedback.blocks}（均非任务成功率）' + gpu_training + archival_health)
+                        self.post('stats', f'短期经验 {len(self.brain.memory)} · 长期经验 {archived} · 操作 {self.iterations} · 可控进展 {feedback.progress_effects}/{feedback.total} · 示范目标画面匹配 {feedback.demonstrated_goal_matches} · 示范指针接近 {feedback.demonstrated_pointer_advances} · 试探点击 {exploration.attempts} 次 / 可观测画面变化 {exploration.effects} 次 · 重复可归因 {feedback.causal_evidence} · 循环 {feedback.loop_count} · 预测误差 {prediction:.3f} · 因果证据强度 {causal:.2f} · 被动基线 {feedback.passive_count} 次 · 受阻 {feedback.blocks}（均非任务成功率）' + gpu_training + archival_health)
                     with self.brain.save_lock:
                         saved_count = len(self.brain.memory)
                     pending = self.iterations - self.last_checkpoint_step
@@ -6989,7 +7385,7 @@ class MouseAIApp:
                     previous = audit.get('last') if isinstance(audit, dict) else None
                     previous_sleep = bool(audit.get('pending_sleep')) if isinstance(audit, dict) else False
                     quality = self.audit_sum / self.audit_samples
-                    current_metrics = {'frames': self.audit_samples, 'mean': quality, 'timestamp': time.time(), 'efficacy': feedback.efficacy_total / max(1, feedback.total), 'progress_rate': feedback.progress_effects / max(1, feedback.total), 'repetition_rate': feedback.repeats / max(1, feedback.total), 'blocked_rate': feedback.blocks / max(1, feedback.total), 'causal_repeats': feedback.causal_evidence, 'backend': self.brain.label if self.brain is not None else '未知'}
+                    current_metrics = {'frames': self.audit_samples, 'mean': quality, 'timestamp': time.time(), 'efficacy': feedback.efficacy_total / max(1, feedback.total), 'progress_rate': feedback.progress_effects / max(1, feedback.total), 'demonstrated_goal_matches': feedback.demonstrated_goal_matches, 'demonstrated_pointer_advances': feedback.demonstrated_pointer_advances, 'repetition_rate': feedback.repeats / max(1, feedback.total), 'blocked_rate': feedback.blocks / max(1, feedback.total), 'causal_repeats': feedback.causal_evidence, 'backend': self.brain.label if self.brain is not None else '未知'}
                     if frame_times:
                         current_metrics['control_fps'] = len(frame_times) / max(sys.float_info.epsilon, sum(frame_times))
                     timed = {'目标与推理': infer_times, '截图耗时': capture_times}
