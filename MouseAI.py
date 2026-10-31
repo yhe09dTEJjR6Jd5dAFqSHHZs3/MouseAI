@@ -239,6 +239,13 @@ def replay_capacity():
         return available
 
 REPLAY_LIMIT = replay_capacity()
+
+def world_model_evidence_floor(parameters, worlds, capacity=None):
+    available = REPLAY_LIMIT if capacity is None else max(1, int(capacity))
+    complexity = math.log2(2. + max(0, int(parameters)))
+    required = math.ceil(complexity * (2. + math.sqrt(1. + max(0, int(worlds)))))
+    return max(1, min(required, max(1, available // 3)))
+
 REPLAY_FILE_RECORD_LIMIT = 131072
 MIN_ARCHIVE_RESERVE_BYTES = 256 * 1024 * 1024
 os.environ['MOUSEAI_REPLAY_CAPACITY'] = str(REPLAY_LIMIT)
@@ -557,6 +564,25 @@ def demonstrated_target_cells(index):
         if any(ACT[action][3].endswith('+') for action in actions):
             targets.setdefault(signature, set()).add((cx, cy))
     return targets
+
+
+def visual_target_pointer_gain(target, before, after, region, meta):
+    if target is None or before == after:
+        return 0.
+    x, y, w, h = region
+    if w <= 0 or h <= 0:
+        return 0.
+    tx, ty, quality = target
+    if not (math.isfinite(tx) and math.isfinite(ty) and math.isfinite(quality)):
+        return 0.
+    start_x, start_y = (before[0] - x) / w, (before[1] - y) / h
+    finish_x, finish_y = (after[0] - x) / w, (after[1] - y) / h
+    original = math.hypot(*pointer_offset(tx - start_x, ty - start_y, meta))
+    remaining = math.hypot(*pointer_offset(tx - finish_x, ty - finish_y, meta))
+    if original <= pointer_pixel_radius(meta) * 1.5 or remaining >= original:
+        return 0.
+    movement = math.hypot(*pointer_offset(finish_x - start_x, finish_y - start_y, meta))
+    return min(1., (original - remaining) / max(pointer_pixel_radius(meta), movement)) * min(1., max(0., quality))
 
 
 def demonstrated_pointer_gain(targets, frame, before, after, region):
@@ -980,6 +1006,7 @@ class TargetNavigator:
         self.focus_key = None
         self.release_pending = False
         self.last_intent = None
+        self.pending_press_effect = 0.
         self.total = 0
 
     @staticmethod
@@ -1023,7 +1050,8 @@ class TargetNavigator:
     def guide(self, action, control, meta, held, steps):
         if self.release_pending and held.get('l'):
             self.release_pending = False
-            self.last_intent = self.focus_key
+            if self.last_intent is None:
+                self.last_intent = self.focus_key
             release = BUTTON_ACTIONS['l', False]
             return release, anchor_control(release)
         if self.release_pending:
@@ -1072,11 +1100,23 @@ class TargetNavigator:
         self.total += 1
         key = self.last_intent
         if key is None:
+            self.pending_press_effect = 0.
             return
-        tries = self.visits[key]
-        good, count = self.outcomes.get(key, (0., 0))
+        switches = tuple(outcome.get('switches') or ())
         effect = max(0., float(reward)) * max(0., min(1., float(outcome.get('efficacy', 1.))))
-        if outcome.get('switches') or outcome.get('scroll'):
+        if outcome.get('blocked'):
+            effect = 0.
+        if 'l+' in switches:
+            self.pending_press_effect = max(self.pending_press_effect, effect)
+            return
+        if 'l-' in switches:
+            effect = max(effect, self.pending_press_effect)
+            self.pending_press_effect = 0.
+        elif switches:
+            self.pending_press_effect = 0.
+        if 'l-' in switches or outcome.get('scroll') or switches:
+            tries = self.visits[key]
+            good, count = self.outcomes.get(key, (0., 0))
             count += 1
             good += (effect - good) / count
             self.outcomes[key] = (good, count)
@@ -1084,8 +1124,13 @@ class TargetNavigator:
             self.last_intent = None
             self.focus = None
             self.focus_key = None
-        elif len(self.outcomes) > REPLAY_LIMIT:
-            self.outcomes.pop(min(self.outcomes, key=lambda k: self.visits[k]), None)
+        limit = max(32, REPLAY_LIMIT * 2)
+        if len(self.visits) > limit:
+            victim_count = max(1, len(self.visits) // 8)
+            for victim in sorted(self.visits, key=self.visits.get)[:victim_count]:
+                if victim not in (self.focus_key, self.last_intent):
+                    self.visits.pop(victim, None)
+                    self.outcomes.pop(victim, None)
 
 
 class Feedback:
@@ -1112,6 +1157,7 @@ class Feedback:
         self.pending_goal = None
         self.demonstrated_goal_matches = 0
         self.demonstrated_pointer_advances = 0
+        self.visual_target_advances = 0
         self.efficacy_total = 0.
         self.stagnant = 0
         self.loop_count = 0
@@ -1121,6 +1167,7 @@ class Feedback:
         self.state_value = {}
         self.causal_evidence = 0
         self.previous_passive = False
+        self.pending_buttons = {}
         try:
             self.numpy = importlib.import_module('numpy')
         except ImportError:
@@ -1134,6 +1181,7 @@ class Feedback:
         self.background_count = 0
         self.previous_passive = False
         self.pending_goal = None
+        self.pending_buttons.clear()
 
     def difference(self, left, right, view=0):
         if len(left) != VIS_N or len(right) != VIS_N or view not in (0, 1):
@@ -1216,6 +1264,16 @@ class Feedback:
         self.recent_states.append(signature)
 
         efficacy = max(0., min(1., float(outcome.get('efficacy', 1.))))
+        switches = tuple(outcome.get('switches') or ())
+        if signal:
+            for button in self.pending_buttons:
+                self.pending_buttons[button] = True
+        completed_without_effect = False
+        for switch in switches:
+            if switch in ('l+', 'r+', 'm+'):
+                self.pending_buttons[switch[0]] = bool(signal)
+            elif switch in ('l-', 'r-', 'm-'):
+                completed_without_effect |= not (self.pending_buttons.pop(switch[0], False) or signal)
         attributable = impact / max(dist, pixel_resolution) if signal else 0.
         novelty = 1. / math.sqrt(1. + transition_visits)
         prior_effect, prior_variance, prior_count = self.action_context.get((context, action), (0., 0., 0))
@@ -1231,9 +1289,13 @@ class Feedback:
         goal_gain = attributable * persistence * float(reached)
         pointer_gain = max(0., min(1., float(outcome.get('demonstration_progress', 0.))))
         pointer_gain *= float(action in MOTION_ACTIONS and outcome.get('moved', 0.) > 0. and not outcome['blocked'])
+        visual_gain = max(0., min(1., float(outcome.get('visual_target_progress', 0.))))
+        visual_gain *= float(action in MOTION_ACTIONS and outcome.get('moved', 0.) > 0. and not outcome['blocked'])
         intrinsic_gain = (causal_strength + discovery * persistence + state_advantage * attributable) * novelty * ((1. + confidence) / 2.)
+        intrinsic_gain += .15 * visual_gain / math.sqrt(1. + transition_visits)
         task_gain = goal_gain + pointer_gain
-        gain = (intrinsic_gain + task_gain) * efficacy * float(not loop)
+        capture_confidence = max(0., min(1., float(outcome.get('capture_confidence', 1.))))
+        gain = (intrinsic_gain + task_gain) * efficacy * capture_confidence * float(not loop)
         if signal:
             n = prior_count + 1
             d = impact - prior_effect
@@ -1243,21 +1305,23 @@ class Feedback:
         attempted = float(action != IDLE_ACTION and not outcome.get('pending_scroll'))
         moved_successfully = bool(action in MOTION_ACTIONS and outcome.get('moved', 0.) > 0.
                                   and efficacy >= .5 and not outcome['blocked'])
-        ineffective = float(not signal and not pointer_gain and not moved_successfully)
+        ineffective = float(not signal and not pointer_gain and not moved_successfully and
+                            (not switches or completed_without_effect))
         failure = attempted * (1. - efficacy)
         failure += float(bool(outcome['blocked']))
         failure += ineffective * repetition * attempted
         failure += repeated_fraction * float(loop)
         failure += attempted * repetition * repeated_fraction * float(
             (ineffective and new_seen >= old_seen) or (loop and not pointer_gain))
-        reward = math.tanh(gain - failure)
+        reward = math.tanh(gain - failure * capture_confidence)
         progress = bool(reward > 0. and efficacy > 0. and not loop and
                         ((signal and scene_changed and (reached or (prior_count > 1 and causal_strength > 0.)))
-                         or (pointer_gain > 0. and moved_successfully)))
+                         or ((pointer_gain > 0. or visual_gain > 0.) and moved_successfully)))
         if reached and efficacy > 0.:
             self.pending_goal = signature
         self.demonstrated_goal_matches += int(reached and efficacy > 0.)
         self.demonstrated_pointer_advances += int(pointer_gain > 0. and not loop)
+        self.visual_target_advances += int(visual_gain > 0. and not loop)
         current_value = (new_value * new_seen + max(0., reward) * float(progress)) / (new_seen + 1.)
         self.state_value[signature] = (current_value, new_seen + 1)
         self.stagnant = 0 if progress else self.stagnant + 1
@@ -1305,12 +1369,26 @@ def stored_experience_digest(records):
 
 
 def replay_extension(previous, current):
-    old, recent = list(previous), list(current)
-    for size in range(min(len(old), len(recent)), 0, -1):
-        if all(a == b or (a[:6] == b[:6] and a[7:] == b[7:])
-               for a, b in zip(old[-size:], recent[:size])):
-            return recent[size:]
-    return None
+    if not previous or not current:
+        return None
+    recent = list(current)
+    pattern = [experience_identity(row) for row in recent]
+    prefix = [0] * len(pattern)
+    for index in range(1, len(pattern)):
+        length = prefix[index - 1]
+        while length and pattern[index] != pattern[length]:
+            length = prefix[length - 1]
+        if pattern[index] == pattern[length]:
+            length += 1
+        prefix[index] = length
+    matched = 0
+    for row in previous:
+        identity = experience_identity(row)
+        while matched and (matched == len(pattern) or identity != pattern[matched]):
+            matched = prefix[matched - 1]
+        if identity == pattern[matched]:
+            matched += 1
+    return recent[matched:] if matched else None
 
 
 def read_replay(folder, slot):
@@ -1419,12 +1497,22 @@ def discard_recovery(folder, generation, records=None):
             left = (*left[:6], False, *left[7:])
             right = (*right[:6], False, *right[7:])
         return experience_header(left) == experience_header(right)
-    matched = any(all(equivalent(a, b) for a, b in zip(saved[start:start + len(backup)], backup))
-                  for start in range(max(0, len(saved) - len(backup) + 1)))
+    matched = False
+    if len(saved) >= len(backup):
+        fingerprints = b''.join(experience_identity(row) for row in saved)
+        needle = b''.join(experience_identity(row) for row in backup)
+        offset = fingerprints.find(needle)
+        while offset >= 0:
+            if offset % 16 == 0:
+                start = offset // 16
+                if all(equivalent(a, b) for a, b in zip(saved[start:start + len(backup)], backup)):
+                    matched = True
+                    break
+            offset = fingerprints.find(needle, offset + 1)
     if not matched:
         minimum_overlap = min(3, len(saved), len(backup))
-        matched = any(all(equivalent(a, b) for a, b in zip(backup[-length:], saved[:length]))
-                      for length in range(minimum_overlap, min(len(saved), len(backup)) + 1))
+        extension = replay_extension(backup, saved)
+        matched = extension is not None and len(saved) - len(extension) >= minimum_overlap
     if matched:
         with file_write_lock(path):
             updated = read_replay(folder, 'recovery')
@@ -1531,6 +1619,12 @@ class LifelongMemory:
         self.failed_writes = 0
         self.spill = deque(maxlen=max(4, 2 * math.isqrt(REPLAY_LIMIT)))
         self.spill_lock = threading.Lock()
+        self.spool_folder = self.folder / '.archive_spool'
+        self.spool_folder.mkdir(parents=True, exist_ok=True)
+        self.spool_files = deque((path, None, 0.) for path in sorted(self.spool_folder.glob('pending.*.record')))
+        self.spool_attempts = Counter()
+        self.recovered_writes = 0
+        self.archive_jobs = 0
         self.write_ms = deque(maxlen=96)
         self.queue_ms = deque(maxlen=96)
         self.pending = queue.Queue(maxsize=max(4, 2 * math.isqrt(REPLAY_LIMIT)))
@@ -1546,43 +1640,98 @@ class LifelongMemory:
             self.unfinished_sequences.discard(sequence)
             self.archive_condition.notify_all()
 
+    def _next_overflow(self):
+        with self.spill_lock:
+            if self.spool_files:
+                path, sequence, ready_at = self.spool_files.popleft()
+                if time.monotonic() >= ready_at:
+                    return None, path, sequence
+                self.spool_files.append((path, sequence, ready_at))
+            if self.spill:
+                return self.spill.popleft(), None, None
+        return None, None, None
+
+    def _retry_spool(self, path, sequence):
+        self.spool_attempts[path] += 1
+        delay = min(60., 2. ** min(6, self.spool_attempts[path]))
+        with self.spill_lock:
+            self.spool_files.append((path, sequence, time.monotonic() + delay))
+
     def _archive_job(self):
         while True:
             from_queue = False
             from_replacement = False
+            spool_path = None
             sequence = None
-            try:
-                item = self.replacements.get_nowait()
-                from_replacement = True
-            except queue.Empty:
+            item = None
+            if self.archive_jobs % 8 == 0:
+                item, spool_path, sequence = self._next_overflow()
+            if item is None and spool_path is None:
                 try:
-                    item = self.pending.get(timeout=.05)
-                    from_queue = True
+                    item = self.replacements.get_nowait()
+                    from_replacement = True
                 except queue.Empty:
-                    with self.spill_lock:
-                        item = self.spill.popleft() if self.spill else None
-                    if item is None:
-                        continue
+                    try:
+                        item = self.pending.get(timeout=.05)
+                        from_queue = True
+                    except queue.Empty:
+                        item, spool_path, sequence = self._next_overflow()
+                        if item is None and spool_path is None:
+                            continue
+            self.archive_jobs += 1
+            completed = False
             try:
                 if from_queue and item is None:
                     return
+                if spool_path is not None:
+                    from_replacement = spool_path.name.startswith('pending.replace.')
+                    try:
+                        row = self.unpack(spool_path.read_bytes())
+                    except OSError as error:
+                        self.error = type(error).__name__ + ': ' + str(error)[:140]
+                        self.failed_writes += 1
+                        self._retry_spool(spool_path, sequence)
+                        continue
+                    except (ValueError, zlib.error, struct.error) as error:
+                        self.error = type(error).__name__ + ': ' + str(error)[:140]
+                        self.failed_writes += 1
+                        self.dropped += 1
+                        quarantine(spool_path)
+                        self.spool_attempts.pop(spool_path, None)
+                        completed = True
+                        continue
+                    item = (row, time.monotonic(), sequence)
                 row, queued, sequence = item
                 started = time.monotonic()
                 self.queue_ms.append((started - queued) * 1000.)
                 try:
                     self._remember(row, replacement=from_replacement)
+                    if spool_path is not None:
+                        spool_path.unlink(missing_ok=True)
+                        self.spool_attempts.pop(spool_path, None)
+                        self.recovered_writes += 1
+                    completed = True
+                    self.error = ''
                 except Exception as error:
                     self.error = type(error).__name__ + ': ' + str(error)[:140]
-                    self.dropped += 1
                     self.failed_writes += 1
+                    if spool_path is not None:
+                        self._retry_spool(spool_path, sequence)
+                    else:
+                        try:
+                            self._spool_to_disk(item, replacement=from_replacement)
+                        except (OSError, MemoryError, ValueError, zlib.error) as spill_error:
+                            self.error = '归档写入和备用落盘均失败：' + str(spill_error)[:120]
+                            self.dropped += 1
+                            completed = True
                 finally:
                     self.write_ms.append((time.monotonic() - started) * 1000.)
             finally:
                 if from_queue:
                     self.pending.task_done()
-                if from_replacement:
+                if from_replacement and spool_path is None:
                     self.replacements.task_done()
-                if sequence is not None:
+                if completed and sequence is not None:
                     self._archive_done(sequence)
 
     @staticmethod
@@ -1618,6 +1767,25 @@ class LifelongMemory:
                 float(reward), bool(done), float(dt), tuple(numeric[META_N * 2:META_N * 2 + CTRL_N]),
                 tuple(numeric[META_N * 2 + CTRL_N:]), executed, float(efficacy), bool(reserved), demonstration, int(capture_code), int(action_mask), int(next_mask))
 
+    def _spool_to_disk(self, entry, replacement=False):
+        row, queued, sequence = entry
+        space = shutil.disk_usage(self.spool_folder)
+        if space.free <= MIN_ARCHIVE_RESERVE_BYTES:
+            raise OSError('数据磁盘剩余空间不足，无法保存归档溢出经验')
+        temporary = unique_temp_path(self.spool_folder / 'pending')
+        prefix = 'pending.replace.' if replacement else 'pending.'
+        destination = self.spool_folder / (prefix + os.urandom(12).hex() + '.record')
+        try:
+            with temporary.open('wb') as stream:
+                stream.write(self.pack(row))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        with self.spill_lock:
+            self.spool_files.append((destination, sequence, 0.))
+
     def remember(self, row, replacement=False):
         with self.archive_condition:
             if row[12] or self.closed:
@@ -1645,12 +1813,20 @@ class LifelongMemory:
                         self.spill.append(entry)
                     else:
                         displaced = entry
-                    self.dropped += 1
             if displaced is not None:
-                self._archive_done(displaced[2])
+                try:
+                    self._spool_to_disk(displaced)
+                except (OSError, MemoryError, ValueError, zlib.error) as error:
+                    self.error = '归档溢出经验无法落盘：' + str(error)[:120]
+                    self.dropped += 1
+                    self.failed_writes += 1
+                    self._archive_done(displaced[2])
 
     def _remember(self, row, replacement=False):
         with self.lock:
+            if self.db is None:
+                raise RuntimeError('长期经验数据库已关闭')
+            self.db.execute('BEGIN IMMEDIATE')
             try:
                 if replacement:
                     payload = self.pack(row)
@@ -1658,51 +1834,63 @@ class LifelongMemory:
                     updated = self.db.execute(
                         'UPDATE experiences SET data=?,priority=max(priority,?),added=? WHERE fingerprint=?',
                         (payload, 1. + abs(float(row[5])), time.time(), fingerprint))
+                    inserted_count = 0
                     if not updated.rowcount:
                         inserted = self.db.execute(
                             'INSERT OR IGNORE INTO experiences(scene,priority,added,data,fingerprint) VALUES(?,?,?,?,?)',
                             (session_signature(row[0]) + bytes((row[2],)),
                              1. + abs(float(row[5])), time.time(), payload, fingerprint))
-                        self.kept += int(inserted.rowcount > 0)
+                        inserted_count = int(inserted.rowcount > 0)
+                    self.db.execute('COMMIT')
+                    self.kept += inserted_count
                     self.error = ''
                     return
                 self.db.execute("INSERT INTO meta(key,value) VALUES('observed',1) "
                                 "ON CONFLICT(key) DO UPDATE SET value=value+1")
-                self.total = int(self.db.execute("SELECT value FROM meta WHERE key='observed'").fetchone()[0])
-                magnitude = abs(row[5])
-                rate = 1. / math.sqrt(self.total)
+                new_total = int(self.db.execute("SELECT value FROM meta WHERE key='observed'").fetchone()[0])
+                magnitude = abs(float(row[5]))
+                rate = 1. / math.sqrt(new_total)
                 delta = magnitude - self.mean
-                self.mean += rate * delta
-                self.variance += rate * (delta * delta - self.variance)
+                new_mean = self.mean + rate * delta
+                new_variance = self.variance + rate * (delta * delta - self.variance)
                 scene = session_signature(row[0]) + bytes((row[2],))
                 visits = self.seen.get(scene, 0) + 1
-                self.seen[scene] = visits
-                if len(self.seen) > max(REPLAY_LIMIT, int(math.sqrt(max(1, self.total)) * 12)):
-                    for key in sorted(self.seen, key=self.seen.get)[:len(self.seen) // 3]:
-                        self.seen.pop(key, None)
-                surprise = magnitude >= self.mean + math.sqrt(max(0., self.variance))
-                periodic = self.total - self.last_saved >= max(1, int(math.sqrt(max(1, self.kept))))
+                surprise = magnitude >= new_mean + math.sqrt(max(0., new_variance))
+                periodic = new_total - self.last_saved >= max(1, int(math.sqrt(max(1, self.kept))))
                 demonstration = len(row) > 13 and row[13]
-                should_keep = demonstration or visits == 1 or surprise or periodic or random.random() < 1. / math.sqrt(1. + visits)
-                if not should_keep:
-                    return
-                priority = max(0., magnitude) + 1. / math.sqrt(visits) + max(0., float(row[11])) / math.sqrt(1. + visits) + float(demonstration)
-                payload = self.pack(row)
-                fingerprint = experience_identity(row)
-                inserted = self.db.execute('INSERT OR IGNORE INTO experiences(scene,priority,added,data,fingerprint) VALUES(?,?,?,?,?)',
-                                           (scene, priority, time.time(), payload, fingerprint))
-                if not inserted.rowcount:
-                    return
-                self.kept += 1
+                should_keep = (demonstration or visits == 1 or surprise or periodic or
+                               random.random() < 1. / math.sqrt(1. + visits))
+                inserted_count = 0
+                if should_keep:
+                    priority = (max(0., magnitude) + 1. / math.sqrt(visits) +
+                                max(0., float(row[11])) / math.sqrt(1. + visits) + float(demonstration))
+                    payload = self.pack(row)
+                    fingerprint = experience_identity(row)
+                    inserted = self.db.execute(
+                        'INSERT OR IGNORE INTO experiences(scene,priority,added,data,fingerprint) VALUES(?,?,?,?,?)',
+                        (scene, priority, time.time(), payload, fingerprint))
+                    inserted_count = int(inserted.rowcount > 0)
+                self.db.execute('COMMIT')
+            except BaseException:
+                try:
+                    self.db.execute('ROLLBACK')
+                except sqlite3.Error:
+                    pass
+                raise
+            self.total = new_total
+            self.mean = new_mean
+            self.variance = new_variance
+            self.seen[scene] = visits
+            if len(self.seen) > max(REPLAY_LIMIT, int(math.sqrt(max(1, self.total)) * 12)):
+                for key in sorted(self.seen, key=self.seen.get)[:len(self.seen) // 3]:
+                    self.seen.pop(key, None)
+            if inserted_count:
+                self.kept += inserted_count
                 self.last_saved = self.total
                 if self.total - self.last_prune >= max(32, int(math.sqrt(max(1, self.kept)))):
                     self.last_prune = self.total
                     self._prune()
-                self.error = ''
-            except (sqlite3.Error, OSError, ValueError, zlib.error) as error:
-                self.error = type(error).__name__ + ': ' + str(error)[:140]
-                self.dropped += 1
-                self.failed_writes += 1
+            self.error = ''
 
     def _prune(self):
         try:
@@ -1784,40 +1972,28 @@ class LifelongMemory:
         deadline = None if timeout is None else time.monotonic() + max(0., float(timeout))
         with self.archive_condition:
             cutoff = self.enqueued_sequence
-        while True:
-            with self.archive_condition:
-                if not any(sequence <= cutoff for sequence in self.unfinished_sequences):
+            while True:
+                unfinished = any(sequence <= cutoff for sequence in self.unfinished_sequences)
+                with self.spill_lock:
+                    outstanding = bool(self.spill or self.spool_files)
+                on_disk = any(self.spool_folder.glob('pending.*.record'))
+                if not unfinished and not outstanding and not on_disk:
                     break
-            with self.spill_lock:
-                overflow = self.spill.popleft() if self.spill and self.spill[0][2] <= cutoff else None
-            if overflow is not None:
-                try:
-                    self._remember(overflow[0])
-                except Exception as error:
-                    self.error = type(error).__name__ + ': ' + str(error)[:140]
-                    self.dropped += 1
-                    self.failed_writes += 1
-                finally:
-                    self._archive_done(overflow[2])
-                continue
-            with self.archive_condition:
-                if not any(sequence <= cutoff for sequence in self.unfinished_sequences):
-                    continue
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0.:
-                    raise TimeoutError('长期经验归档超过等待上限，保留重放检查点供下次恢复')
+                    raise TimeoutError('长期经验归档超过等待上限，磁盘待处理记录留待重试')
                 self.archive_condition.wait(.05 if remaining is None else min(.05, remaining))
         with self.lock:
             if self.db is None:
                 return
             try:
-                self.db.execute("INSERT INTO meta(key,value) VALUES('observed',?) ON CONFLICT(key) DO UPDATE SET value=max(value,excluded.value)", (self.total,))
                 self.db.execute('PRAGMA wal_checkpoint(PASSIVE)')
             except sqlite3.Error as error:
                 self.error = str(error)[:140]
                 self.failed_writes += 1
-        if self.failed_writes:
-            raise RuntimeError(f'长期归档有 {self.failed_writes} 次写入失败，保留完整重放检查点供恢复：{self.error[:120]}')
+                raise RuntimeError('长期经验 WAL 写盘确认失败') from error
+        if self.dropped:
+            raise RuntimeError(f'长期归档有 {self.dropped} 条经验未能恢复，保留重放检查点：{self.error[:120]}')
 
     def close(self):
         with self.archive_condition:
@@ -1922,13 +2098,10 @@ class GoalAtlas:
         cx, cy = ((left + right) / 2. - x) / w, ((top + bottom) / 2. - y) / h
         name = ' '.join(str(label).casefold().split())[:256]
         key = scene.hex()
-        prefix = key[:22]
         with self.lock:
             return any(item[0] == name and item[1] == role and
                        abs(item[2] - cx) <= .025 and abs(item[3] - cy) <= .025
-                       for signature, entries in self.demonstrated_elements.items()
-                       if signature == key or signature.startswith(prefix)
-                       for item in entries)
+                       for item in self.demonstrated_elements.get(key, ()))
 
     def signature(self, image):
         cell = coarse_image_cells(image)
@@ -2045,6 +2218,7 @@ class LiteBrain:
         self.table = {}
         self.actor = {}
         self.visits = {}
+        self.imitation_votes = {}
         self.steps = 0
         self.discount_rate = 0.
         self.memory = deque(maxlen=REPLAY_LIMIT)
@@ -2065,13 +2239,14 @@ class LiteBrain:
         recovered = list(replay_sources(folder))
         for generation, slot, records in recovered:
             data = read_json(folder / f'learning.{slot}.lite.gz', {})
-            if not isinstance(data, dict) or data.get('version') != 14 or data.get('generation') != generation or data.get('replay_count', len(records)) != getattr(records, 'source_count', len(records)):
+            if not isinstance(data, dict) or data.get('version') not in (14, 15) or data.get('generation') != generation or data.get('replay_count', len(records)) != getattr(records, 'source_count', len(records)):
                 continue
             if data.get('replay_digest') is not None and data['replay_digest'] != stored_experience_digest(records).hex():
                 continue
             table = {}
             actor = {}
             visits = {}
+            imitation_votes = {}
             for key, value in (data.get('table') or {}).items() if isinstance(data.get('table'), dict) else ():
                 try:
                     keybytes = bytes.fromhex(key)
@@ -2095,11 +2270,19 @@ class LiteBrain:
                         visits[keybytes] = value
                 except (TypeError, ValueError, OverflowError):
                     continue
+            for key, value in (data.get('imitation_votes') or {}).items() if isinstance(data.get('imitation_votes'), dict) else ():
+                try:
+                    keybytes = bytes.fromhex(key)
+                    numbers = [float(v) for v in value]
+                    if len(keybytes) in (CELLS_PER_VIEW * 2 + 5, 14, 13) and len(numbers) == ACT_N and all(math.isfinite(v) and 0. <= v <= 1e9 for v in numbers):
+                        imitation_votes[keybytes] = numbers
+                except (TypeError, ValueError, OverflowError):
+                    continue
             try:
                 steps = max(0, int(data.get('steps', 0)))
             except (TypeError, ValueError, OverflowError):
                 continue
-            self.table, self.actor, self.visits = table, actor, visits
+            self.table, self.actor, self.visits, self.imitation_votes = table, actor, visits, imitation_votes
             self.steps = steps
             self.memory, self.generation, self.slot = records, generation, slot if isinstance(slot, int) else -1
             break
@@ -2107,7 +2290,7 @@ class LiteBrain:
             generation, slot, records = recovered[0]
             self.latest_replay_generation = generation
             if generation != self.generation:
-                additional = replay_extension(self.memory, records) if self.generation and self.table else None
+                additional = replay_extension(self.memory, records) if self.generation and (self.table or self.imitation_votes) else None
                 self.memory = records
                 self.slot = slot if isinstance(slot, int) else -1
                 if additional is None:
@@ -2120,7 +2303,7 @@ class LiteBrain:
             self.steps = max(self.steps, len(records), getattr(records, 'source_count', len(records)))
         elif not self.table:
             self.steps = 0
-        if self.memory and not self.table:
+        if self.memory and not (self.table or self.imitation_votes):
             self.rebuild_from_memory()
         self.discount_rate = observed_discount_rate(self.memory)
         self.control_evidence = ControlEvidence(self.memory)
@@ -2134,6 +2317,7 @@ class LiteBrain:
             self.table.clear()
             self.actor.clear()
             self.visits.clear()
+            self.imitation_votes.clear()
             for row in self.memory:
                 if not row[12]:
                     self.update(row)
@@ -2172,13 +2356,31 @@ class LiteBrain:
             return None
         return [sum(part[action] for part in values) / len(values) for action in range(ACT_N)]
 
+    def scores(self, ob, meta, keys=None):
+        keys = self.keys(ob, meta) if keys is None else keys
+        q = self.values(ob, meta, keys)
+        votes = [self.imitation_votes[key] for key in keys if key in self.imitation_votes]
+        if not votes:
+            return q
+        counts = [sum(part[action] for part in votes) / len(votes) for action in range(ACT_N)]
+        baseline = sum(counts) / ACT_N
+        spread = math.sqrt(sum((item - baseline) ** 2 for item in counts) / ACT_N)
+        if spread <= sys.float_info.epsilon:
+            return q
+        q = q if q is not None else [0.] * ACT_N
+        mean_q = sum(q) / ACT_N
+        value_scale = max(.05, math.sqrt(sum((item - mean_q) ** 2 for item in q) / ACT_N))
+        evidence = sum(counts)
+        confidence = evidence / (evidence + max(4., math.sqrt(1. + self.steps)))
+        return [q[action] + .75 * confidence * value_scale * (counts[action] - baseline) / spread for action in range(ACT_N)]
+
     def choose(self, ob, meta, held, targets=None, allowed_actions=None):
         opts = [action for action in candidates(held) if allowed_actions is None or action in allowed_actions]
         if not opts:
             return IDLE_ACTION, anchor_control(IDLE_ACTION)
         with self.save_lock:
             keys = self.keys(ob, meta)
-            q = self.values(ob, meta, keys)
+            q = self.scores(ob, meta, keys)
             visits = sum(self.visits.get(key, 0) for key in keys)
             epsilon = adaptive_exploration(self.steps, visits, 1. / math.sqrt(1. + len(keys) if q is not None else 1.))
             exploring = q is None or random.random() < epsilon
@@ -2197,18 +2399,22 @@ class LiteBrain:
     def update(self, row):
         ob, meta, action, nxt, nmeta, reward, done, dt = row[:8]
         keys = self.keys(ob, meta)
-        before = self.values(ob, meta, keys)
-        after = self.values(nxt, nmeta)
-        successors = future_action_candidates(nmeta, row[16] if len(row) > 16 else SAFE_FUTURE_MASK)
-        future = max(after[i] for i in successors) if after else 0.
-        target = reward + (0. if done else temporal_discount(dt, self.discount_rate) * future)
-        baseline = before[action] if before is not None else 0.
-        if len(row) > 13 and row[13]:
-            target = max(target, max(before or [0.]) + 1. / math.sqrt(1. + self.visits.get(keys[0], 0)))
-        correction = (target - baseline) / math.sqrt(1. + self.visits.get(keys[0], 0))
+        demonstration = len(row) > 13 and row[13]
+        if not demonstration:
+            before = self.values(ob, meta, keys)
+            after = self.values(nxt, nmeta)
+            successors = future_action_candidates(nmeta, row[16] if len(row) > 16 else SAFE_FUTURE_MASK)
+            future = max(after[i] for i in successors) if after else 0.
+            target = reward + (0. if done else temporal_discount(dt, self.discount_rate) * future)
+            baseline = before[action] if before is not None else 0.
+            correction = (target - baseline) / math.sqrt(1. + self.visits.get(keys[0], 0))
         for key in keys:
-            value = self.table.setdefault(key, [0.] * ACT_N)
-            value[action] += correction
+            if demonstration:
+                votes = self.imitation_votes.setdefault(key, [0.] * ACT_N)
+                votes[action] = min(1e9, votes[action] + max(.01, min(1., float(row[11]))))
+            else:
+                value = self.table.setdefault(key, [0.] * ACT_N)
+                value[action] += correction
             self.visits[key] = self.visits.get(key, 0) + 1
             if len(row) > 11 and (reward > 0. or (len(row) > 13 and row[13])) and row[11] > 0.:
                 actor_key = key + bytes([action])
@@ -2218,10 +2424,13 @@ class LiteBrain:
                 executed = anchor_control(action, row[8], 1.)
                 intended = anchor_control(action, row[9], 1.)
                 self.actor[actor_key] = [old[i] * (1. - rate) + (executed[i] * efficacy + intended[i] * (1. - efficacy)) * rate for i in range(CTRL_N)]
-        if len(self.table) > REPLAY_LIMIT * len(keys):
-            evicted = set(sorted(self.table, key=lambda key: self.visits.get(key, 0))[:max(1, len(self.table) // 8)])
+        limit = REPLAY_LIMIT * len(keys)
+        if max(len(self.table), len(self.imitation_votes)) > limit:
+            known = set(self.table) | set(self.imitation_votes)
+            evicted = set(sorted(known, key=lambda key: self.visits.get(key, 0))[:max(1, len(known) // 8)])
             for key in evicted:
                 self.table.pop(key, None)
+                self.imitation_votes.pop(key, None)
                 self.visits.pop(key, None)
             self.actor = {key: value for key, value in self.actor.items() if key[:-1] not in evicted}
 
@@ -2270,7 +2479,7 @@ class LiteBrain:
             return None
         good = 0
         for row in useful:
-            q = self.values(row[0], row[1]) or [0.] * ACT_N
+            q = self.scores(row[0], row[1]) or [0.] * ACT_N
             choices = future_action_candidates(row[1], row[15] if len(row) > 15 else SAFE_FUTURE_MASK)
             best = max(choices, key=lambda a: q[a])
             good += (best == row[2]) if (row[5] > 0. or (len(row) > 13 and row[13])) else (best != row[2])
@@ -2288,9 +2497,14 @@ class LiteBrain:
     def evaluation_losses(self, records, labels):
         losses = []
         for row, target in zip(records, labels):
-            values = self.values(row[0], row[1])
-            error = abs((values[row[2]] if values is not None else 0.) - target)
-            losses.append((.5 * error * error if error < 1. else error - .5) + (max(0., max(values or [0.]) - (values[row[2]] if values is not None else 0.)) if len(row) > 13 and row[13] else 0.))
+            if len(row) > 13 and row[13]:
+                scores = self.scores(row[0], row[1]) or [0.] * ACT_N
+                choices = future_action_candidates(row[1], row[15] if len(row) > 15 else SAFE_FUTURE_MASK)
+                losses.append(max(0., max(scores[i] for i in choices) - scores[row[2]]))
+            else:
+                values = self.values(row[0], row[1])
+                error = abs((values[row[2]] if values is not None else 0.) - target)
+                losses.append(.5 * error * error if error < 1. else error - .5)
         return losses
 
     def evaluate(self, records, labels):
@@ -2315,7 +2529,7 @@ class LiteBrain:
             baseline_losses = self.evaluation_losses(validation, labels)
             before = sum(baseline_losses) / len(validation)
             quality = self.policy_metric(validation)
-            self.sleep_evaluation = (validation, labels, before, quality, copy.deepcopy(self.table), copy.deepcopy(self.actor), copy.deepcopy(self.visits), baseline_losses)
+            self.sleep_evaluation = (validation, labels, before, quality, copy.deepcopy(self.table), copy.deepcopy(self.actor), copy.deepcopy(self.visits), baseline_losses, copy.deepcopy(self.imitation_votes))
 
     def abort_sleep(self):
         with self.save_lock:
@@ -2323,6 +2537,7 @@ class LiteBrain:
                 self.table = self.sleep_evaluation[4]
                 self.actor = self.sleep_evaluation[5]
                 self.visits = self.sleep_evaluation[6]
+                self.imitation_votes = self.sleep_evaluation[8]
             self.train_memory = None
             self.sleep_evaluation = None
             self.sleep_best = None
@@ -2332,13 +2547,13 @@ class LiteBrain:
         with self.save_lock:
             if self.sleep_evaluation is None:
                 return None
-            records, labels, before, quality, snapshot, previous_actor, previous_visits, baseline_losses = self.sleep_evaluation
+            records, labels, before, quality, snapshot, previous_actor, previous_visits, baseline_losses, previous_votes = self.sleep_evaluation
             losses = self.evaluation_losses(records, labels)
             after = sum(losses) / len(losses)
             current = self.policy_metric(records)
             if verified_improvement(records, baseline_losses, losses) and not policy_regressed(quality, current, records):
                 if self.sleep_best is None or after < self.sleep_best[0]:
-                    self.sleep_best = (after, current, copy.deepcopy(self.table), copy.deepcopy(self.actor), copy.deepcopy(self.visits))
+                    self.sleep_best = (after, current, copy.deepcopy(self.table), copy.deepcopy(self.actor), copy.deepcopy(self.visits), copy.deepcopy(self.imitation_votes))
             return {'loss': after, 'verified': self.sleep_best is not None, 'best': self.sleep_best[0] if self.sleep_best is not None else None, 'baseline': before}
 
     def end_sleep(self):
@@ -2348,7 +2563,7 @@ class LiteBrain:
                 return None
             evaluation = self.sleep_progress()
             after = evaluation['loss'] if evaluation is not None else float('nan')
-            records, labels, before, quality, snapshot, previous_actor, previous_visits, baseline_losses = self.sleep_evaluation
+            records, labels, before, quality, snapshot, previous_actor, previous_visits, baseline_losses, previous_votes = self.sleep_evaluation
             self.sleep_evaluation = None
             best = self.sleep_best
             self.sleep_best = None
@@ -2356,16 +2571,16 @@ class LiteBrain:
             self.sleep_audit = None
             current = self.policy_metric(records)
             if best is not None:
-                self.table, self.actor, self.visits = best[2:5]
+                self.table, self.actor, self.visits, self.imitation_votes = best[2:6]
                 if audit is not None:
                     audit_rows, audit_targets, audit_before, audit_policy = audit
                     audit_after = self.evaluate(audit_rows, audit_targets)
                     audit_current = self.policy_metric(audit_rows)
                     if not math.isfinite(audit_after) or audit_after > audit_before or policy_regressed(audit_policy, audit_current, audit_rows):
-                        self.table, self.actor, self.visits = snapshot, previous_actor, previous_visits
+                        self.table, self.actor, self.visits, self.imitation_votes = snapshot, previous_actor, previous_visits, previous_votes
                         return False, before, audit_after, quality, audit_current
                 return True, before, best[0], quality, best[1]
-            self.table, self.actor, self.visits = snapshot, previous_actor, previous_visits
+            self.table, self.actor, self.visits, self.imitation_votes = snapshot, previous_actor, previous_visits, previous_votes
             degraded = not math.isfinite(after) or after > before or policy_regressed(quality, current, records)
             return (False if degraded else None), before, after, quality, current
 
@@ -2376,7 +2591,7 @@ class LiteBrain:
                 memory = list(self.memory)
                 generation = max(self.generation, self.latest_replay_generation) + 1
                 slot = (self.slot + 1) % 2
-                data = {'version': 14, 'generation': generation, 'steps': self.steps, 'replay_count': len(memory), 'replay_digest': experience_digest(memory).hex(), 'table': {k.hex(): v[:] for k, v in self.table.items()}, 'actor': {k.hex(): v[:] for k, v in self.actor.items()}, 'visits': {k.hex(): v for k, v in self.visits.items()}}
+                data = {'version': 15, 'generation': generation, 'steps': self.steps, 'replay_count': len(memory), 'replay_digest': experience_digest(memory).hex(), 'table': {k.hex(): v[:] for k, v in self.table.items()}, 'actor': {k.hex(): v[:] for k, v in self.actor.items()}, 'visits': {k.hex(): v for k, v in self.visits.items()}, 'imitation_votes': {k.hex(): v[:] for k, v in self.imitation_votes.items()}}
             save_replay(self.folder, memory, slot, generation)
             save_json(self.folder / f'learning.{slot}.lite.gz', data)
             with self.save_lock:
@@ -2456,6 +2671,7 @@ class TorchBrain:
                 self.visual_growing = nn.ModuleList()
                 self.reconstruction = nn.Sequential(nn.Linear(160 + META_N, 256), nn.GELU(), nn.Linear(256, CHANNELS * 2 * RECON_H * RECON_W), nn.Sigmoid())
                 self.policy = nn.Sequential(nn.Linear(160 + META_N, 192), nn.GELU(), nn.Linear(192, ACT_N))
+                self.behavior = nn.Sequential(nn.Linear(160 + META_N, 128), nn.GELU(), nn.Linear(128, ACT_N))
                 self.control = nn.Sequential(nn.Linear(160 + META_N, 128), nn.GELU(), nn.Linear(128, ACT_N * CTRL_N), nn.Tanh())
                 self.effect = nn.Sequential(nn.Linear(160 + META_N + CTRL_N, 160), nn.GELU(), nn.Linear(160, 1))
                 self.execution = nn.Sequential(nn.Linear(160 + META_N + CTRL_N, 128), nn.GELU(), nn.Linear(128, 1), nn.Sigmoid())
@@ -2498,6 +2714,9 @@ class TorchBrain:
                 for layer in self.growing:
                     embedding = layer(embedding)
                 return self.policy(embedding), self.policy_controls(embedding), embedding
+
+            def imitation_logits(self, embedding):
+                return self.behavior(embedding)
 
             def reconstruct(self, embedding):
                 return self.reconstruction(embedding)
@@ -2587,6 +2806,7 @@ class TorchBrain:
         self.gpu_train_batches = 0
         self.steps = 0
         self.grads = 0
+        self.imitation_updates = 0
         self.train_memory = None
         self.sleep_evaluation = None
         self.sleep_best = None
@@ -2608,8 +2828,9 @@ class TorchBrain:
                 continue
             try:
                 state = torch.load(path, map_location='cpu', weights_only=True)
-                if state.get('version') != 19:
+                if state.get('version') not in (19, 20):
                     continue
+                legacy_state = state['version'] == 19
                 depth = int(state.get('capacity_depth', 0))
                 worlds = int(state.get('capacity_world_models', 0))
                 visual_depth = int(state.get('capacity_visual_depth', 0))
@@ -2628,9 +2849,17 @@ class TorchBrain:
                 before_opt = cpu_snapshot(self.t, self.optq.state_dict())
                 try:
                     self.resize_capacity(depth, worlds, visual_depth)
-                    self.q.load_state_dict(state['q'], strict=True)
-                    self.target.load_state_dict(state['target'], strict=True)
-                    self.optq.load_state_dict(state['opt'])
+                    if legacy_state:
+                        for module, weights in ((self.q, state['q']), (self.target, state['target'])):
+                            missing, unexpected = module.load_state_dict(weights, strict=False)
+                            expected = {key for key in module.state_dict() if key.startswith('behavior.')}
+                            if set(missing) != expected or unexpected:
+                                raise ValueError('旧模型参数结构不兼容')
+                        self.optq.state.clear()
+                    else:
+                        self.q.load_state_dict(state['q'], strict=True)
+                        self.target.load_state_dict(state['target'], strict=True)
+                        self.optq.load_state_dict(state['opt'])
                 except Exception:
                     self.resize_capacity(old_depth, old_worlds, old_visual_depth)
                     self.q.load_state_dict(before_q)
@@ -2643,6 +2872,7 @@ class TorchBrain:
                 self.visual_growth_at_step = max(0, int(state.get('visual_growth_at_step', 0)))
                 self.steps = max(0, int(state.get('steps', 0)))
                 self.grads = max(0, int(state.get('grads', 0)))
+                self.imitation_updates = max(0, int(state.get('imitation_updates', 0))) if not legacy_state else 0
                 self.model_generation = generation
                 self.model_slot = slot
             except Exception as error:
@@ -2687,7 +2917,7 @@ class TorchBrain:
                           self.historical_samples, self.discount_rate, self.gpu_train_started, self.gpu_train_examples,
                           self.gpu_train_batches, self.perf.copy(), self.batch_sizes.copy(),
                           self.batch_limits.copy(), self.training_latency.copy(),
-                          self.training_throughput.copy())
+                          self.training_throughput.copy(), self.imitation_updates)
             image_a = bytes(VIS_N)
             image_b = bytes([7]) * VIS_N
             meta = tuple(0. for _ in range(META_N))
@@ -2696,7 +2926,7 @@ class TorchBrain:
             synthetic = [(image_a, meta, action_a, image_b, meta, .1, True, .05,
                           control_a, control_a, action_a, 1., False, False, CAPTURE_VERIFIED),
                          (image_b, meta, action_b, image_a, meta, .2, True, .05,
-                          control_b, control_b, action_b, 1., False, False, CAPTURE_VERIFIED)]
+                          control_b, control_b, action_b, 1., False, True, CAPTURE_VERIFIED)]
             try:
                 self.train_memory = synthetic
                 self.sampler_key = None
@@ -2719,7 +2949,7 @@ class TorchBrain:
                  self.sampler, self.sampler_key, self.sampler_source, self.sampler_built_at, self.historical_refreshed,
                  self.historical_samples, self.discount_rate, self.gpu_train_started, self.gpu_train_examples,
                  self.gpu_train_batches, self.perf, self.batch_sizes,
-                 self.batch_limits, self.training_latency, self.training_throughput) = old_values
+                 self.batch_limits, self.training_latency, self.training_throughput, self.imitation_updates) = old_values
                 self.q.eval()
                 self.target.eval()
 
@@ -2781,7 +3011,7 @@ class TorchBrain:
         worlds = len(self.q.world_models)
         visual_depth = len(self.q.visual_growing)
         layer_evidence = max(8, int(math.log2(2. + parameters) * math.sqrt(1. + depth)))
-        model_evidence = max(layer_evidence, int(math.sqrt(2. + parameters) * math.sqrt(1. + worlds)))
+        model_evidence = max(layer_evidence, world_model_evidence_floor(parameters, worlds))
         visual_evidence = max(layer_evidence, int(math.log2(2. + parameters) * math.sqrt(2. + visual_depth) * 2))
         grow_layer = diverse >= layer_evidence and self.steps - self.growth_at_step >= layer_evidence
         grow_model = diverse >= model_evidence and self.steps - self.world_growth_at_step >= model_evidence
@@ -2859,7 +3089,8 @@ class TorchBrain:
                     spread = teacher.square().mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-5)
                     weights = t.softmax(teacher / spread, dim=-1)
                     with self.autocast():
-                        predicted = self.q(frames, features)[0]
+                        embedded = self.q(frames, features)[2]
+                        predicted = self.q.imitation_logits(embedded)
                         loss = -(weights * t.log_softmax(predicted, dim=-1)).sum(dim=-1).mean()
                     if not bool(t.isfinite(loss).item()):
                         raise ValueError('策略迁移出现非有限训练误差')
@@ -2882,6 +3113,7 @@ class TorchBrain:
                         if getattr(self.d, 'type', None) == 'cuda':
                             self.cuda_optimizer_steps += 1
                         trained += len(rows)
+                        self.imitation_updates += len(rows)
                 if trained:
                     self.target.load_state_dict(self.q.state_dict())
                     self.target.eval()
@@ -2927,6 +3159,16 @@ class TorchBrain:
         self.perf['transfer_ms'] += (elapsed - self.perf['transfer_ms']) / math.sqrt(1. + self.steps)
         return target
 
+    def policy_scores(self, qvalues, embedding):
+        if self.imitation_updates <= 0:
+            return qvalues
+        logits = self.q.imitation_logits(embedding)
+        centered = logits - logits.mean(dim=-1, keepdim=True)
+        expert_scale = centered.std(dim=-1, unbiased=False, keepdim=True).clamp(min=1e-4)
+        value_scale = qvalues.detach().std(dim=-1, unbiased=False, keepdim=True).clamp(min=.05)
+        strength = self.imitation_updates / (self.imitation_updates + max(8., math.sqrt(max(1, len(self.memory)))))
+        return qvalues + .75 * strength * value_scale * centered / expert_scale
+
     def choose(self, ob, meta, held, targets=None, allowed_actions=None):
         allowed = [action for action in candidates(held) if allowed_actions is None or action in allowed_actions]
         if not allowed:
@@ -2948,7 +3190,7 @@ class TorchBrain:
                     current_likelihood = likelihood.clone()
                     confidence = 1. - adaptive_exploration(self.steps, self.grads)
                     confidence *= self.grads / (self.grads + math.sqrt(max(1, len(self.memory))))
-                    metric = q[0] + confidence * (returns * likelihood - returns.detach().mean())
+                    metric = self.policy_scores(q, embedding)[0] + confidence * (returns * likelihood - returns.detach().mean())
                     if self.grads > 0:
                         imagined, disagreement = self.q.predict_with_uncertainty(expanded, candidate)
                         spread = q[0].detach().std(unbiased=False)
@@ -3110,7 +3352,11 @@ class TorchBrain:
             verified_demo = t.tensor([len(row) > 14 and row[13] and bool(row[14] & CAPTURE_VERIFIED) for row in immediate], dtype=t.float32, device=self.d)
             autonomous = 1. - demonstration
             autonomous_count = autonomous.sum().clamp(min=1.)
-            world_usable = autonomous + verified_demo
+            capture_quality = t.tensor(
+                [1. if len(row) > 14 and row[14] & CAPTURE_VERIFIED else
+                 .85 if len(row) > 14 and (row[14] & 0x7f) == CAPTURE_SOURCES['gdi'] else .7
+                 for row in immediate], dtype=t.float32, device=self.d)
+            world_usable = (autonomous + verified_demo) * capture_quality
             world_count = world_usable.sum().clamp(min=1.)
             immediate_future = self.images([row[3] for row in immediate])
             immediate_meta = t.tensor([row[4] for row in immediate], dtype=t.float32, device=self.d)
@@ -3173,7 +3419,7 @@ class TorchBrain:
             good = t.sigmoid(advantage / immediate_reward.detach().std(unbiased=False).clamp(min=1e-4))
             desired = ctrl * efficacy[:, None] + intended * (1. - efficacy[:, None])
             auxiliary = ((predicted - desired).square().mean(dim=1) * (good * efficacy * autonomous + demonstration)).mean()
-            imitation_loss = (t.nn.functional.cross_entropy(qvalues, acts, reduction='none') * demonstration).sum() / demonstration.sum().clamp(min=1.)
+            imitation_loss = (t.nn.functional.cross_entropy(self.q.imitation_logits(embedding), acts, reduction='none') * demonstration).sum() / demonstration.sum().clamp(min=1.)
             for module in (self.q.effect, self.q.execution):
                 for param in module.parameters():
                     param.requires_grad_(False)
@@ -3207,6 +3453,7 @@ class TorchBrain:
                 optimizer_updated = True
             if optimizer_updated:
                 self.grads += 1
+                self.imitation_updates += int(demonstration.sum().item())
                 if getattr(self.d, 'type', None) == 'cuda':
                     self.cuda_optimizer_steps += 1
             if not sleeping and self.grads % max(2, int(math.sqrt(max(1, self.steps)))) == 0:
@@ -3297,7 +3544,7 @@ class TorchBrain:
                 estimated, disagreement = self.q.predict_with_uncertainty(features, controls)
                 dynamics_loss = t.nn.functional.smooth_l1_loss(estimated, next_features, reduction='none').mean(dim=1) + disagreement.sqrt()
                 demonstration = t.tensor([len(row) > 13 and row[13] for row in segment], dtype=t.float32, device=self.d)
-                imitation_loss = t.nn.functional.cross_entropy(values, actions, reduction='none') * demonstration
+                imitation_loss = t.nn.functional.cross_entropy(self.q.imitation_logits(features), actions, reduction='none') * demonstration
                 segment_loss = (q_loss + effect_loss + execution_loss + dynamics_loss + inverse_loss) * (1. - demonstration) + actor_loss + visual_loss + imitation_loss
                 losses.extend(segment_loss.cpu().tolist())
         return losses
@@ -3308,7 +3555,7 @@ class TorchBrain:
     def performance(self):
         with self.save_lock:
             training = self.training_throughput[self.train_memory is not None]
-            metrics = {'world_models': 2 + len(self.q.world_models), 'transfer_ms': round(self.perf['transfer_ms'], 3), 'inference_ms': round(self.perf['inference_ms'], 3), 'training_samples_per_second': round(training, 2), 'batches': self.perf['batches'], 'training_examples': self.perf['training_examples'], 'visual_error': round(self.perf['visual_error'], 5), 'batch_size': self.batch_sizes[self.train_memory is not None], 'archive_count': self.archive.kept, 'archive_total_observed': self.archive.total, 'capacity_layers': len(self.q.growing), 'vision_layers': len(self.q.visual_growing), 'model_parameters': sum(parameter.numel() for parameter in self.q.parameters()), 'planning_trust': round(self.planning_trust, 3), 'world_model_ratio': round(self.planning_ratio, 3) if self.planning_ratio is not None else None}
+            metrics = {'world_models': 2 + len(self.q.world_models), 'transfer_ms': round(self.perf['transfer_ms'], 3), 'inference_ms': round(self.perf['inference_ms'], 3), 'training_samples_per_second': round(training, 2), 'batches': self.perf['batches'], 'training_examples': self.perf['training_examples'], 'imitation_updates': self.imitation_updates, 'visual_error': round(self.perf['visual_error'], 5), 'batch_size': self.batch_sizes[self.train_memory is not None], 'archive_count': self.archive.kept, 'archive_total_observed': self.archive.total, 'capacity_layers': len(self.q.growing), 'vision_layers': len(self.q.visual_growing), 'model_parameters': sum(parameter.numel() for parameter in self.q.parameters()), 'planning_trust': round(self.planning_trust, 3), 'world_model_ratio': round(self.planning_ratio, 3) if self.planning_ratio is not None else None}
             if self.inference_durations:
                 timings = sorted(self.inference_durations)
                 metrics['inference_p95_ms'] = round(timings[int(.95 * (len(timings) - 1))], 3)
@@ -3386,7 +3633,8 @@ class TorchBrain:
             evaluation_batch = max(1, self.batch_sizes[True])
             for start in range(0, len(examples), evaluation_batch):
                 part = examples[start:start + evaluation_batch]
-                q = self.q(self.images([r[0] for r in part]), self.t.tensor([r[1] for r in part], dtype=self.t.float32, device=self.d))[0].cpu().tolist()
+                logits, _, embedding = self.q(self.images([r[0] for r in part]), self.t.tensor([r[1] for r in part], dtype=self.t.float32, device=self.d))
+                q = self.policy_scores(logits, embedding).cpu().tolist()
                 for row, scores in zip(part, q):
                     choices = future_action_candidates(row[1], row[15] if len(row) > 15 else SAFE_FUTURE_MASK)
                     chosen = max(choices, key=lambda a: scores[a])
@@ -3446,7 +3694,7 @@ class TorchBrain:
             quality = self.policy_metric(validation)
             effect_before = self.effect_metric(validation)
             dynamics_before = self.dynamics_metric(validation)
-            self.sleep_evaluation = (validation, labels, before, quality, cpu_snapshot(self.t, self.q.state_dict()), cpu_snapshot(self.t, self.target.state_dict()), cpu_snapshot(self.t, self.optq.state_dict()), self.grads, effect_before, dynamics_before, baseline_losses)
+            self.sleep_evaluation = (validation, labels, before, quality, cpu_snapshot(self.t, self.q.state_dict()), cpu_snapshot(self.t, self.target.state_dict()), cpu_snapshot(self.t, self.optq.state_dict()), self.grads, effect_before, dynamics_before, baseline_losses, self.imitation_updates)
             return {'capacity_layers': len(self.q.growing), 'vision_layers': len(self.q.visual_growing), 'world_models': 2 + len(self.q.world_models), 'parameters': sum(parameter.numel() for parameter in self.q.parameters()), 'expanded': any(step == self.steps and step > 0 for step in (self.growth_at_step, self.world_growth_at_step, self.visual_growth_at_step))}
 
     def abort_sleep(self):
@@ -3456,6 +3704,7 @@ class TorchBrain:
                 self.target.load_state_dict(self.sleep_evaluation[5])
                 self.optq.load_state_dict(self.sleep_evaluation[6])
                 self.grads = self.sleep_evaluation[7]
+                self.imitation_updates = self.sleep_evaluation[11]
             self.train_memory = None
             self.sampler_key = None
             self.sampler_source = None
@@ -3481,7 +3730,7 @@ class TorchBrain:
             dynamics_ok = dynamics_before is None or (dynamics_after is not None and math.isfinite(dynamics_after) and dynamics_after <= dynamics_before)
             if effect_ok and dynamics_ok and verified_improvement(records, self.sleep_evaluation[10], losses) and not policy_regressed(quality, current, records):
                 if self.sleep_best is None or after < self.sleep_best[0]:
-                    self.sleep_best = (after, current, cpu_snapshot(self.t, self.q.state_dict()), cpu_snapshot(self.t, self.target.state_dict()), cpu_snapshot(self.t, self.optq.state_dict()), self.grads)
+                    self.sleep_best = (after, current, cpu_snapshot(self.t, self.q.state_dict()), cpu_snapshot(self.t, self.target.state_dict()), cpu_snapshot(self.t, self.optq.state_dict()), self.grads, self.imitation_updates)
             return {'loss': after, 'verified': self.sleep_best is not None, 'best': self.sleep_best[0] if self.sleep_best is not None else None, 'baseline': before}
 
     def rollback_sleep_capacity(self):
@@ -3505,7 +3754,7 @@ class TorchBrain:
                 return None
             evaluation = self.sleep_progress()
             after = evaluation['loss'] if evaluation is not None else float('nan')
-            records, labels, before, quality, old_q, old_target, old_opt, old_grads, old_effect, old_dynamics, baseline_losses = self.sleep_evaluation
+            records, labels, before, quality, old_q, old_target, old_opt, old_grads, old_effect, old_dynamics, baseline_losses, old_imitation = self.sleep_evaluation
             self.sleep_evaluation = None
             best = self.sleep_best
             self.sleep_best = None
@@ -3521,6 +3770,7 @@ class TorchBrain:
                 self.target.load_state_dict(best[3])
                 self.optq.load_state_dict(best[4])
                 self.grads = best[5]
+                self.imitation_updates = best[6]
                 if audit is not None:
                     audit_rows, audit_targets, audit_before, audit_policy, audit_effect, audit_dynamics = audit
                     audit_after = self.evaluate(audit_rows, audit_targets)
@@ -3532,6 +3782,7 @@ class TorchBrain:
                         self.target.load_state_dict(old_target)
                         self.optq.load_state_dict(old_opt)
                         self.grads = old_grads
+                        self.imitation_updates = old_imitation
                         self.rollback_sleep_capacity()
                         self.calibrate_planning(audit_rows)
                         return False, before, audit_after, quality, audit_current
@@ -3542,6 +3793,7 @@ class TorchBrain:
             self.target.load_state_dict(old_target)
             self.optq.load_state_dict(old_opt)
             self.grads = old_grads
+            self.imitation_updates = old_imitation
             self.rollback_sleep_capacity()
             if audit is not None:
                 self.calibrate_planning(audit[0])
@@ -3560,6 +3812,7 @@ class TorchBrain:
                 'opt': cpu_snapshot(self.t, self.optq.state_dict()),
                 'steps': self.steps,
                 'grads': self.grads,
+                'imitation_updates': self.imitation_updates,
                 'capacity_depth': len(self.q.growing),
                 'capacity_visual_depth': len(self.q.visual_growing),
                 'capacity_world_models': len(self.q.world_models),
@@ -3593,7 +3846,7 @@ class TorchBrain:
             original_q = cpu_snapshot(self.t, self.q.state_dict())
             original_target = cpu_snapshot(self.t, self.target.state_dict())
             original_opt = cpu_snapshot(self.t, self.optq.state_dict())
-            original_status = (self.steps, self.grads, self.growth_at_step, self.growth_attempts,
+            original_status = (self.steps, self.grads, self.imitation_updates, self.growth_at_step, self.growth_attempts,
                                self.world_growth_at_step, self.visual_growth_at_step,
                                self.planning_trust, self.planning_ratio)
             try:
@@ -3640,6 +3893,7 @@ class TorchBrain:
                     raise ValueError('迁移后规划参数异常')
                 self.steps = new_steps
                 self.grads = new_grads
+                self.imitation_updates = max(0, int(snapshot.get('imitation_updates', 0)))
                 self.growth_at_step = new_growth
                 self.growth_attempts = new_attempts
                 self.world_growth_at_step = new_world_growth
@@ -3654,7 +3908,7 @@ class TorchBrain:
                     self.q.load_state_dict(original_q, strict=True)
                     self.target.load_state_dict(original_target, strict=True)
                     self.optq.load_state_dict(original_opt)
-                    (self.steps, self.grads, self.growth_at_step, self.growth_attempts,
+                    (self.steps, self.grads, self.imitation_updates, self.growth_at_step, self.growth_attempts,
                      self.world_growth_at_step, self.visual_growth_at_step,
                      self.planning_trust, self.planning_ratio) = original_status
                     self.q.eval()
@@ -3682,7 +3936,7 @@ class TorchBrain:
                     slot = (protected_slot + 1) % 2
                     model_slot = slot
                     steps = self.steps
-                    snapshot = {'version': 19, 'generation': generation, 'q': cpu_copy(self.q.state_dict()), 'target': cpu_copy(self.target.state_dict()), 'opt': cpu_copy(self.optq.state_dict()), 'steps': steps, 'grads': self.grads, 'replay_count': len(memory), 'replay_digest': experience_digest(memory).hex(), 'capacity_depth': len(self.q.growing), 'capacity_visual_depth': len(self.q.visual_growing), 'capacity_world_models': len(self.q.world_models), 'growth_at_step': self.growth_at_step, 'growth_attempts': self.growth_attempts, 'world_growth_at_step': self.world_growth_at_step, 'visual_growth_at_step': self.visual_growth_at_step}
+                    snapshot = {'version': 20, 'generation': generation, 'q': cpu_copy(self.q.state_dict()), 'target': cpu_copy(self.target.state_dict()), 'opt': cpu_copy(self.optq.state_dict()), 'steps': steps, 'grads': self.grads, 'imitation_updates': self.imitation_updates, 'replay_count': len(memory), 'replay_digest': experience_digest(memory).hex(), 'capacity_depth': len(self.q.growing), 'capacity_visual_depth': len(self.q.visual_growing), 'capacity_world_models': len(self.q.world_models), 'growth_at_step': self.growth_at_step, 'growth_attempts': self.growth_attempts, 'world_growth_at_step': self.world_growth_at_step, 'visual_growth_at_step': self.visual_growth_at_step}
             path = self.folder / f'model.{model_slot}.pt'
             tmp = unique_temp_path(path)
             try:
@@ -4270,9 +4524,17 @@ class RemoteBrain:
 
     def cancel_train(self):
         self.train_cancel.set()
+        self.train_preempt.set()
+
+    def preempt_training(self):
+        self.train_preempt.set()
 
     def reset_train_cancel(self):
         self.train_cancel.clear()
+
+    def reset_train_preempt(self):
+        if not self.inference_pending.is_set():
+            self.train_preempt.clear()
 
     def begin_sleep(self):
         self.train_cancel.clear()
@@ -4636,10 +4898,22 @@ if os.name == 'nt':
             pass
 
 
+def stable_window_identity(executable, classname, title):
+    executable = str(executable or '').strip().casefold()
+    classname = str(classname or '').strip().casefold()
+    normalized_title = ' '.join(str(title or '').strip().casefold().split())
+    normalized_title = re.sub(r'\s+(?:[-–—]\s*)?(?:google chrome|microsoft edge|mozilla firefox)\s*$', '', normalized_title)
+    if executable:
+        return executable + '|' + classname
+    if classname and classname not in ('#32770', 'mainwindow', 'window', 'dialog'):
+        return 'class|' + classname
+    return 'title|' + normalized_title
+
+
 def window_fingerprint(hwnd, title):
     identity = ' '.join(title.strip().casefold().split())
     if os.name != 'nt':
-        return identity
+        return stable_window_identity('', '', identity)
     pid = wintypes.DWORD()
     if not u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)):
         return identity
@@ -4654,12 +4928,12 @@ def window_fingerprint(hwnd, title):
             size = wintypes.DWORD(len(buf))
             if kernel32.QueryFullProcessImageNameW(process, 0, buf, ctypes.byref(size)):
                 executable = buf.value.casefold()
-                return executable + '|' + kind + '|' + identity if identity else executable + '|' + kind
+                return stable_window_identity(executable, kind, identity)
         finally:
             kernel32.CloseHandle(process)
     if browser:
-        return 'browser|' + kind + '|' + identity
-    return (kind + '|' + identity) if kind else identity
+        return stable_window_identity('browser', kind, identity)
+    return stable_window_identity('', kind, identity)
 
 
 def selected_data_folder():
@@ -4825,6 +5099,8 @@ class WindowsIO:
         self.motion_scale = 1.
         self.grabber = None
         self.grabber_errors = 0
+        self.dxcam_retry_at = 0.
+        self.dxcam_recovery_needed = False
         self.capture_failures = {'wgc': 0, 'dxcam': 0, 'gdi': 0}
         self.capture_quality = {name: {'mean_ms': 0., 'samples': 0, 'bad': 0} for name in ('wgc', 'dxcam', 'gdi')}
         self.capture_selected_at = 0.
@@ -5087,7 +5363,9 @@ class WindowsIO:
                 pass
             return True
         callback = WNDPROC(visit)
-        u.EnumChildWindows(self.hwnd, callback, 0)
+        active_window = self.active_control_hwnd()
+        if active_window is not None:
+            u.EnumChildWindows(active_window, callback, 0)
         if self.com_initialized:
             candidates_to_probe = [(int(x + width * point[0]), int(y + height * point[1])) for point in visual_points[:20]]
             candidates_to_probe.insert(0, self.cursor())
@@ -5264,6 +5542,24 @@ class WindowsIO:
         self.gdi_snapshot_bitmap = None
         self.gdi_snapshot_old = None
 
+    def dxcam_ready(self):
+        return (self.grabber is not None and time.monotonic() >= self.dxcam_retry_at and
+                (self.capture_preference != 'gdi' or self.dxcam_recovery_needed))
+
+    def dxcam_failed(self):
+        self.grabber_errors += 1
+        self.dxcam_recovery_needed = True
+        self.dxcam_retry_at = time.monotonic() + min(60., 2. ** min(self.grabber_errors, 6))
+
+    def dxcam_succeeded(self):
+        self.grabber_errors = 0
+        self.dxcam_retry_at = 0.
+        if self.dxcam_recovery_needed and self.capture_preference == 'gdi':
+            self.capture_preference = 'dxcam'
+            self.capture_selected_at = time.monotonic()
+            self.capture_recovery = 'DXCAM 已通过重新采样验证，恢复 GPU 截图后端'
+        self.dxcam_recovery_needed = False
+
     def capture(self, x, y, w, h, force_gdi=False):
         if (not force_gdi and self.capture_preference == 'auto' and self.wgc is not None
                 and not self.wgc_closed and self.active_control_hwnd() == self.hwnd):
@@ -5294,7 +5590,7 @@ class WindowsIO:
                                     return self.captured(self.resample(image[y0:y1, x0:x1]), 'wgc', stamp, frame_id)
             except Exception:
                 self.capture_failures['wgc'] += 1
-        if not force_gdi and self.capture_preference != 'gdi' and self.grabber is not None and self.grabber_errors < max(3, int(math.sqrt(max(1, self.capture_epoch + 1)))):
+        if not force_gdi and self.dxcam_ready():
             try:
                 cached = self.frozen_dxcam
                 if cached is not None:
@@ -5307,11 +5603,13 @@ class WindowsIO:
                     stamp = time.monotonic()
                     if image is not None and not self.capture_metadata and image.shape[:2] == (h, w):
                         self.frozen_dxcam = (image, x, y, stamp)
-                if image is not None and len(image.shape) == 3 and image.shape[2] >= 3:
-                    self.grabber_errors = 0
-                    return self.captured(self.resample(image), 'dxcam', stamp)
+                if image is None or len(image.shape) != 3 or image.shape[2] < 3:
+                    raise RuntimeError('DXCAM 未取得完整画面')
+                result = self.resample(image)
+                self.dxcam_succeeded()
+                return self.captured(result, 'dxcam', stamp)
             except Exception:
-                self.grabber_errors += 1
+                self.dxcam_failed()
                 self.capture_failures['dxcam'] += 1
         if not g.StretchBlt(self.mem, 0, 0, VIS_W, VIS_H, self.src, x, y, w, h, 0x00CC0020):
             self.capture_failures['gdi'] += 1
@@ -5504,11 +5802,14 @@ class WindowsIO:
                     if self.last_frame_backend == 'wgc':
                         with self.wgc_lock:
                             self.wgc_probe_frame_id = self.wgc_frame_id
-                        self.capture_preference = 'dxcam' if self.grabber is not None and self.grabber_errors < max(3, int(math.sqrt(max(1, self.capture_epoch + 1)))) else 'gdi'
-                        self.capture_recovery = f'WGC 在 {budget:.2f}s 内无新画面（静态窗口可能正常），改用 {self.capture_preference.upper()} 复核'
-                    elif self.last_frame_backend == 'dxcam':
                         self.capture_preference = 'gdi'
-                        self.capture_recovery = 'DXCAM 无法确认动作后新画面，已改用 GDI 连续采集'
+                        self.capture_selected_at = time.monotonic()
+                        self.capture_recovery = f'WGC 在 {budget:.2f}s 内没有动作后新帧，改用同步 GDI 截图复核静态画面'
+                    elif self.last_frame_backend == 'dxcam':
+                        self.dxcam_failed()
+                        self.capture_preference = 'gdi'
+                        self.capture_selected_at = time.monotonic()
+                        self.capture_recovery = 'DXCAM 无法确认动作后新画面，已改用 GDI 连续采集并计划重试'
                     else:
                         self.capture_recovery = f'{self.last_frame_backend} 截图未通过新鲜度校验，等待重新同步'
                     return None
@@ -6448,6 +6749,8 @@ class MouseAIApp:
         self.exit_backup = None
         self.shutdown_worker = None
         self.acceleration_cleanup = None
+        self.retired_workers = set()
+        self.retired_lock = threading.Lock()
         self.exit_backup_error = None
         self.last_checkpoint_step = 0
         self.last_checkpoint_time = time.monotonic()
@@ -7641,7 +7944,7 @@ class MouseAIApp:
                             eligible = [row for row in rows if not row[12]]
                             max_samples = max(1, int(math.sqrt(len(eligible)) * math.sqrt(max(1, os.cpu_count() or 1))))
                             selected = random.sample(eligible, min(len(eligible), max_samples))
-                            samples = [(row[0], row[1], values) for row in selected if (values := self.brain.values(row[0], row[1])) is not None]
+                            samples = [(row[0], row[1], values) for row in selected if (values := self.brain.scores(row[0], row[1])) is not None]
                         if samples and not cancel.is_set():
                             self.post('accelerator', 'GPU 正在学习轻量模型已经掌握的操作偏好')
                             try:
@@ -7686,7 +7989,8 @@ class MouseAIApp:
                     elif valid and ready is None:
                         self.acceleration_failures += 1
                         elapsed = max(time.monotonic() - started_at, .001)
-                        self.next_backend_retry = time.monotonic() + min(3600., elapsed * (2 ** min(self.acceleration_failures, 10)))
+                        retry = min(180., max(12., elapsed * (2 ** min(self.acceleration_failures, 5))))
+                        self.next_backend_retry = time.monotonic() + retry
                     elif valid:
                         self.acceleration_failures = 0
                         self.next_backend_retry = 0.
@@ -7695,6 +7999,20 @@ class MouseAIApp:
 
         self.acceleration_thread = threading.Thread(target=prepare, daemon=True)
         self.acceleration_thread.start()
+
+    def retire_backend(self, backend):
+        def release():
+            try:
+                backend.close()
+            except Exception as error:
+                self.post('status', '旧计算后端释放异常：' + str(error)[:75])
+            finally:
+                with self.retired_lock:
+                    self.retired_workers.discard(threading.current_thread())
+        worker = threading.Thread(target=release, daemon=True)
+        with self.retired_lock:
+            self.retired_workers.add(worker)
+        worker.start()
 
     def upgrade_backend(self, io=None):
         with self.acceleration_lock:
@@ -7784,11 +8102,8 @@ class MouseAIApp:
                     self.start_online()
                 except Exception as error:
                     self.post('status', '新后端在线训练尚未启动：' + str(error)[:75])
-            try:
-                previous.close()
-            except Exception as error:
-                self.post('status', '旧计算资源释放出现问题：' + str(error)[:70])
-            self.post('status', '已切换到 ' + candidate.label + '，交互经验已同步')
+            self.retire_backend(previous)
+            self.post('status', '已切换到 ' + candidate.label + '，交互经验已同步，旧资源正在后台释放')
             if candidate.engine_backend == 'directml' and self.nvidia_present:
                 self.start_acceleration()
             return True
@@ -8069,6 +8384,7 @@ class MouseAIApp:
         self.online_stop.clear()
         if isinstance(self.brain, RemoteBrain):
             self.brain.reset_train_cancel()
+            self.brain.reset_train_preempt()
         self.online_worker = threading.Thread(target=self.online_job, args=(self.brain,), daemon=True)
         self.online_worker.start()
 
@@ -8097,11 +8413,13 @@ class MouseAIApp:
         self.task_outcome = None
         self.status.set('已收到绿色按钮启动指令，正在将控制权交给所选窗口；任意键盘输入立即取消')
         self.phase.set('启动 AI 控制')
+        if isinstance(self.brain, RemoteBrain):
+            self.brain.preempt_training()
+        self.online_stop.set()
         if self.mode == 'idle':
             self.session_hwnd = hwnd
         else:
             self.observer_stop.set()
-            self.online_stop.set()
         self.activate_selected_window(hwnd)
         if self.mode == 'idle':
             self.root.after(180, self.start)
@@ -8134,8 +8452,10 @@ class MouseAIApp:
             self.root.after(150, self.start)
             return
         if self.online_worker is not None and self.online_worker.is_alive():
+            if isinstance(self.brain, RemoteBrain):
+                self.brain.preempt_training()
             self.status.set('正在移交后台训练线程，随后开始控制')
-            self.root.after(150, self.start)
+            self.root.after(90, self.start)
             return
         self.data_folder, self.environment_code = environment_for(self.folder, hwnd, self.combo_var.get())
         try:
@@ -8880,9 +9200,10 @@ class MouseAIApp:
                         outcome['goal_demonstrated'] = planner.current_goal_demonstrated
                     if action in MOTION_ACTIONS and outcome['moved'] > 0.:
                         outcome['demonstration_progress'] = demonstrated_pointer_gain(demonstration_targets, frame, mouse, new_mouse, region)
+                        outcome['visual_target_progress'] = visual_target_pointer_gain(navigator.focus, mouse, new_mouse, region, meta)
                     capture_code = CAPTURE_SOURCES.get(io.last_frame_backend, 0) | (CAPTURE_VERIFIED if io.last_frame_confirmed else 0)
-                    if not io.last_frame_confirmed:
-                        outcome['efficacy'] *= .7
+                    outcome['capture_confidence'] = (1. if io.last_frame_confirmed else
+                                                     .85 if io.last_frame_backend == 'gdi' else .7)
                     outcome['local_aligned'] = (frame_crop is not None and frame_crop == io.last_crop_region and
                                                 mouse == new_mouse and outcome.get('moved', 0.) < 1.)
                     reward, change, advanced = feedback.assess(frame, nxt, reference_frame, outcome, new_mouse, region)
@@ -8976,16 +9297,16 @@ class MouseAIApp:
                         archive = getattr(self.brain, 'archive', None)
                         archived = archive.kept if archive is not None else perf.get('archive_count', '后台保存')
                         self.post('goal', planner.description if planner is not None else '目标规划未启动')
-                        archival_health = (f' · 归档排队 {archive.pending.qsize()} · 溢出未归档 {archive.dropped} · 写入失败 {archive.failed_writes} · 写盘P95 {p95(archive.write_ms):.1f}ms · 排队P95 {p95(archive.queue_ms):.1f}ms' + (' · 归档异常 ' + archive.error[:65] if archive.error else '')) if archive is not None else ''
+                        archival_health = (f' · 归档排队 {archive.pending.qsize()} · 溢出未归档 {archive.dropped} · 失败尝试 {archive.failed_writes} · 自动恢复 {archive.recovered_writes} · 写盘P95 {p95(archive.write_ms):.1f}ms · 排队P95 {p95(archive.queue_ms):.1f}ms' + (' · 归档异常 ' + archive.error[:65] if archive.error else '')) if archive is not None else ''
                         with self.hook_event_lock:
                             attributed_events = sum(self.ai_mouse_attribution.values())
                         self.post('metrics', (
                             f'动作质量：执行率 {feedback.efficacy_total / max(1, feedback.total):.1%} · 受阻率 {feedback.blocks / max(1, feedback.total):.1%} · 重复率 {feedback.repeats / max(1, feedback.total):.1%} · AI归属鼠标事件 {attributed_events}',
                             f'探索实绩：左键按下 {autonomous_left_presses} · 按下后确认画面变化 {confirmed_navigation_changes} · 可用动作 {ACT_N} 种 · 已见场景 {len(feedback.frequency)}',
-                            f'学习证据：可控进展 {feedback.progress_effects} · 确认目标 {feedback.verified_goal_matches} · 因果观测 {feedback.causal_evidence} · 实际任务成功率需要任务定义',
+                            f'学习证据：可控进展 {feedback.progress_effects} · 视觉目标接近 {feedback.visual_target_advances} · 示范目标确认 {feedback.verified_goal_matches} · 因果观测 {feedback.causal_evidence} · 实际任务成功率需要任务定义',
                             f'运行性能：{fps:.1f}FPS · 采集 {io.last_capture_ms:.0f}ms · 推理P95 {p95(infer_times):.0f}ms · 保存代 {self.brain.generation}',
                         ))
-                        self.post('stats', f'短期经验 {len(self.brain.memory)} · 长期经验 {archived} · 实时经验上限 {getattr(self.brain, "replay_runtime_limit", REPLAY_LIMIT)} · 操作 {self.iterations} · 可控进展 {feedback.progress_effects}/{feedback.total} · 示范目标画面匹配 {feedback.demonstrated_goal_matches} · 连续画面确认 {feedback.verified_goal_matches} · 示范指针接近 {feedback.demonstrated_pointer_advances} · 试探点击 {exploration.attempts} 次 / 可观测画面变化 {exploration.effects} 次 · 重复可归因 {feedback.causal_evidence} · 循环 {feedback.loop_count} · 预测误差 {prediction:.3f} · 因果证据强度 {causal:.2f} · 被动基线 {feedback.passive_count} 次 · 受阻 {feedback.blocks}（均非任务成功率）' + gpu_training + archival_health)
+                        self.post('stats', f'短期经验 {len(self.brain.memory)} · 长期经验 {archived} · 实时经验上限 {getattr(self.brain, "replay_runtime_limit", REPLAY_LIMIT)} · 操作 {self.iterations} · 可控进展 {feedback.progress_effects}/{feedback.total} · 示范目标画面匹配 {feedback.demonstrated_goal_matches} · 连续画面确认 {feedback.verified_goal_matches} · 示范指针接近 {feedback.demonstrated_pointer_advances} · 视觉目标接近 {feedback.visual_target_advances} · 试探点击 {exploration.attempts} 次 / 可观测画面变化 {exploration.effects} 次 · 重复可归因 {feedback.causal_evidence} · 循环 {feedback.loop_count} · 预测误差 {prediction:.3f} · 因果证据强度 {causal:.2f} · 被动基线 {feedback.passive_count} 次 · 受阻 {feedback.blocks}（均非任务成功率）' + gpu_training + archival_health)
                     with self.brain.save_lock:
                         saved_count = len(self.brain.memory)
                     pending = self.iterations - self.last_checkpoint_step
@@ -9183,6 +9504,11 @@ class MouseAIApp:
             for task in (self.acceleration_thread, self.capture_worker):
                 if task is not None and task.is_alive() and task is not threading.current_thread():
                     task.join()
+            with self.retired_lock:
+                retiring = tuple(self.retired_workers)
+            for task in retiring:
+                if task is not threading.current_thread():
+                    task.join(timeout=90.)
         except Exception as error:
             self.post('error', '关闭安装组件时出现异常：' + str(error)[:115])
         finally:
@@ -9209,7 +9535,9 @@ class MouseAIApp:
 
     def finish_close(self):
         elapsed = time.monotonic() - self.close_started
-        saving = any(task is not None and task.is_alive() for task in (self.saver, self.exit_backup, self.shutdown_worker))
+        with self.retired_lock:
+            retired_busy = any(task.is_alive() for task in self.retired_workers)
+        saving = retired_busy or any(task is not None and task.is_alive() for task in (self.saver, self.exit_backup, self.shutdown_worker))
         deadline = 120. if saving else min(30., max(12., self.watchdog_limit * 4.))
         busy = any(task is not None and task.is_alive() for task in (self.worker, self.control_worker, self.saver, self.online_worker, self.acceleration_cleanup, self.acceleration_thread, self.capture_worker, self.key_thread, self.safety_thread, self.exit_backup, self.release_worker, self.initializer))
         main_busy = any(task is not None and task.is_alive() for task in (self.worker, self.saver, self.online_worker))
@@ -9222,7 +9550,7 @@ class MouseAIApp:
                         self.exit_backup_error = '学习后端关闭异常：' + str(error)[:125]
             self.shutdown_worker = threading.Thread(target=cleanup, daemon=True)
             self.shutdown_worker.start()
-        busy |= self.shutdown_worker is not None and self.shutdown_worker.is_alive()
+        busy |= (self.shutdown_worker is not None and self.shutdown_worker.is_alive()) or retired_busy
         tracked = (self.worker, self.control_worker, self.saver, self.online_worker, self.acceleration_cleanup, self.acceleration_thread, self.capture_worker, self.key_thread, self.safety_thread, self.exit_backup, self.release_worker, self.shutdown_worker, self.initializer)
         pending = sum(task is not None and task.is_alive() for task in tracked)
         finished = sum(task is not None and not task.is_alive() for task in tracked)
